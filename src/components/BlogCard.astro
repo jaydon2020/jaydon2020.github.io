@@ -71,7 +71,7 @@ const subpostCount = !isSubpost(entry.id) ? await getSubpostCount(entry.id) : 0
               <span class="text-muted-foreground/40">·</span>
               <div class="flex flex-wrap items-center gap-1">
                 {entry.data.tags.slice(0, 2).map((tag) => {
-                  const { variant, className, tooltip } = getTagVariant(tag)
+                  const { className, tooltip } = getTagVariant(tag)
                   return (
                     <div class="group/tag relative">
                       <span class={`text-[10px] px-1.5 py-0.5 rounded font-medium text-muted-foreground/70 hover:text-foreground transition-colors ${className || ''}`}>
