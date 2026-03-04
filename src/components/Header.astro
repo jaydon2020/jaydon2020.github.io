@@ -3,7 +3,7 @@ import Link from '@/components/Link.astro'
 import ThemeToggle from '@/components/ThemeToggle.astro'
 import MobileMenu from '@/components/ui/mobile-menu'
 import SearchButton from '@/components/react/SearchButton'
-import { NAV_LINKS } from '@/consts'
+import { NAV_LINKS, SITE } from '@/consts'
 import { Icon } from 'astro-icon/components'
 
 const isExternalLink = (href: string) => {
@@ -15,7 +15,7 @@ const isExternalLink = (href: string) => {
   <div class="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-4 p-4">
     <Link href="/" class="flex shrink-0 items-center gap-2 text-xl font-medium" data-astro-reload>
       <img 
-        src="/static/logo.svg" 
+        src="/static/logo.png" 
         alt="Logo" 
         class="size-8 dark:block hidden" 
         width="32" 
@@ -25,7 +25,7 @@ const isExternalLink = (href: string) => {
         transition:persist="logo-dark"
       />
       <img 
-        src="/static/logod.svg" 
+        src="/static/logo.png"
         alt="Logo" 
         class="size-8 dark:hidden block" 
         width="32" 
@@ -34,7 +34,7 @@ const isExternalLink = (href: string) => {
         fetchpriority="high"
         transition:persist="logo-light"
       />
-     <!-- <span class="hidden min-[400px]:block">{SITE.title}</span> -->
+     <span class="hidden min-[400px]:block">{SITE.title}</span>
     </Link>
     <div class="flex items-center gap-2 md:gap-4">
       <nav class="hidden items-center gap-4 text-sm sm:gap-6 md:flex">

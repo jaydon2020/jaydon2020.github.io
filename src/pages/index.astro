@@ -127,12 +127,13 @@ const experience: ExperienceItem[] = [
               <Icon name="lucide:arrow-right" class="size-4" />
             </Link>
             <Link href="/about" class={buttonVariants({ variant: 'outline', size: 'lg' })}>
-              About me
+              <Icon name="lucide:github" class="size-4" />
+              Github
             </Link>
           </div>
           
           <!-- Social Icons -->
-          <div class="pt-2">
+          <!-- <div class="pt-2">
             <ul class="flex flex-wrap items-center gap-2" role="list">
               {SOCIAL_LINKS.map(({ href, label }: SocialLink) => (
                 <li>
@@ -154,14 +155,14 @@ const experience: ExperienceItem[] = [
                 </li>
               ))}
             </ul>
-          </div>
+          </div> -->
         </div>
       </div>
     </div>
   </section>
 
   <!-- Experience Timeline -->
-  <section class="mt-8">
+  <!-- <section class="mt-8">
     <div class="mb-6">
       <h2 class="text-2xl font-semibold mb-2">Experience</h2>
       <p class="text-sm text-muted-foreground">
@@ -198,10 +199,10 @@ const experience: ExperienceItem[] = [
         </div>
       ))}
     </div>
-  </section>
+  </section> -->
 
   <!-- Skills & Technologies (Optional) -->
-  <section class="mt-12">
+  <!-- <section class="mt-12">
     <div class="mb-6">
       <h2 class="text-2xl font-semibold mb-2">Skills & Technologies</h2>
       <p class="text-sm text-muted-foreground">
@@ -211,7 +212,7 @@ const experience: ExperienceItem[] = [
     <ErrorBoundary client:load transition:persist="skills-error-boundary">
       <Skills client:load transition:persist="skills-section" />
     </ErrorBoundary>
-  </section>
+  </section> -->
 
   <!-- Latest from the blog -->
   {latestPosts && latestPosts.length > 0 && (
