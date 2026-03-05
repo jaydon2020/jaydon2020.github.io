@@ -15,7 +15,7 @@ import type { SocialLink } from '@/types'
 // Error handling for fetching recent posts
 let latestPosts: Awaited<ReturnType<typeof getRecentPosts>> = []
 try {
-  latestPosts = await getRecentPosts(2)
+  latestPosts = await getRecentPosts(5)
 } catch (error) {
   console.error('Error fetching recent posts:', error)
 }

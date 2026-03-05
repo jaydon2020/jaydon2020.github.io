@@ -1,0 +1,139 @@
+---
+title: "How to Configure Wi-Fi on a Raspberry Pi 5 Running Minimal Yocto"
+description: "A step-by-step guide to troubleshooting and setting up Wi-Fi on a Raspberry Pi 5 that runs a minimal Yocto image using wpa_supplicant and systemd-networkd, without NetworkManager."
+date: 2026-03-05
+tags: ["Raspberry Pi", "Yocto", "Networking", "Linux"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+Navigating networking on a minimal Linux distribution can sometimes feel like solving a puzzle. If you are running a custom Yocto image on a Raspberry Pi 5 and trying to get your Wi-Fi working without the luxury of `NetworkManager`, you might run into a few roadblocks. 
+
+When you check your network interfaces using `networkctl` and see that `wlan0` is sitting stubbornly in an "off" and "unmanaged" state, it’s a clear sign that the default networking mechanisms aren't kicking in as expected. Here is a comprehensive guide to understanding why this happens and how to fix it using `wpa_supplicant` and `systemd-networkd`.
+
+## The Problem: The "Yocto Factor"
+
+In a standard Raspberry Pi OS setup, NetworkManager typically handles everything seamlessly out of the box. However, in a custom, minimal Yocto build, `wpa_supplicant` might be running via D-Bus (often denoted by the `-u` flag in its process string) but without a dedicated configuration file or a defined control interface.
+
+Because of this missing link between the hardware and the daemon, running `wpa_cli -i wlan0` to interactively connect to a network results in an error like:
+
+```text
+Could not connect to wpa_supplicant: wlan0 - re-trying
+```
+
+This means `wpa_cli` is essentially shouting into a void. Let's manually bridge that gap.
+
+## 1. Create the Missing Configuration
+
+We need to provide `wpa_supplicant` with a configuration file that explicitly defines the control interface socket required by `wpa_cli`.
+
+Create the directory and the configuration file:
+
+```bash
+sudo mkdir -p /etc/wpa_supplicant
+sudo tee /etc/wpa_supplicant/wpa_supplicant.conf > /dev/null <<EOF
+ctrl_interface=/var/run/wpa_supplicant
+ctrl_interface_group=0
+update_config=1
+EOF
+```
+
+- **`ctrl_interface`**: Creates the socket that `wpa_cli` uses to connect.
+- **`update_config=1`**: Allows `wpa_cli` to save new networks directly back to this file.
+
+## 2. Bind `wpa_supplicant` to the Interface
+
+The existing `wpa_supplicant` service, managed by systemd, is likely running generally without being bound to the `wlan0` interface. We need to kill that process, bring the wireless interface up at the kernel level, and restart the daemon manually.
+
+```bash
+# Stop the D-Bus version from running
+sudo systemctl stop wpa_supplicant
+
+# Force wlan0 up at the kernel level
+sudo ip link set wlan0 up
+
+# Start wpa_supplicant manually, linking it to the config and interface
+sudo wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf
+```
+
+<Callout variant="tip">
+The `-B` flag runs the process in the background, `-i` specifies the interface, and `-c` points to the new configuration file we just made.
+</Callout>
+
+## 3. Connect via `wpa_cli`
+
+Now that the daemon is explicitly watching `wlan0` and has a control socket at `/var/run/wpa_supplicant`, `wpa_cli` will work as expected:
+
+```bash
+sudo wpa_cli -i wlan0
+```
+
+Once inside the interactive prompt (`>`), you can scan and connect to your network:
+
+```text
+> scan
+> scan_results
+> add_network
+0
+> set_network 0 ssid "Your_Network_Name"
+> set_network 0 psk "Your_Password"
+> enable_network 0
+> save_config
+> quit
+```
+
+## 4. Make it Persistent with `systemd-networkd`
+
+Even after successfully connecting to your Wi-Fi network, `networkctl` may still report the interface as `unmanaged`. This happens because `systemd-networkd` doesn't automatically know it should manage IP assignment for this link.
+
+To fix this and ensure the lifecycle is managed correctly on subsequent reboots, create a `.network` profile to handle DHCP:
+
+```bash
+sudo tee /etc/systemd/network/25-wlan0.network > /dev/null <<EOF
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=yes
+EOF
+```
+
+Restart the network manager to apply the changes:
+
+```bash
+sudo systemctl restart systemd-networkd
+```
+
+Your `wlan0` interface should now be properly configured, connected, and assigned an IP address!
+
+## Troubleshooting: "Failed to initiate sched scan"
+
+While working through these steps, checking your systemctl logs (`sudo systemctl status wpa_supplicant`) might reveal the following error:
+
+```text
+wlan0: Failed to initiate sched scan
+```
+
+This commonly occurs if the interface is soft-blocked by a software switch or if there are issues with power saving modes affecting the Wi-Fi chip.
+
+To resolve this:
+1. Try disabling power management for the interface to see if scanning resumes:
+   ```bash
+   sudo iw dev wlan0 set power_save off
+   ```
+2. Double-check that your radio is not blocked using `rfkill`:
+   ```bash
+   sudo rfkill list
+   sudo rfkill unblock wifi
+   ```
+
+By manually defining the control interface for `wpa_supplicant` and tying IP configuration to `systemd-networkd`, you can successfully tame the Wi-Fi on a custom Yocto build for the Raspberry Pi 5. Happy tinkering!
+
+## References
+
+- [wpa_supplicant D-Bus interface](https://w1.fi/wpa_supplicant/devel/dbus.html)
+- [Arch Wiki: systemd-networkd](https://wiki.archlinux.org/title/Systemd-networkd)
+- [Arch Wiki: wpa_supplicant](https://wiki.archlinux.org/title/Wpa_supplicant)
+- [Arch Wiki: ConnMan](https://wiki.archlinux.org/title/ConnMan)

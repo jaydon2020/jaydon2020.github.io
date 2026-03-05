@@ -1,0 +1,213 @@
+---
+title: "AGL GSoC 2026 Quiz: Building a Custom Flutter App on Automotive Grade Linux (Raspberry Pi 5 Edition)"
+description: "A comprehensive guide on creating a custom Flutter application, packaging it into a Yocto layer, and embedding it into an AGL image for the Google Summer of Code 2026 qualifying task."
+date: 2026-03-05
+tags: ["AGL", "Flutter", "Yocto", "GSoC", "Raspberry Pi"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+As part of the screening process for the Automotive Grade Linux (AGL) Google Summer of Code 2026, candidates were tasked with proving their proficiency in the Yocto Project and AGL embedded Linux ecosystems. This post documents my journey and solution for deploying to a physical hardware target.
+
+The challenge was to build an image from AGL's `master` branch containing a custom application that features:
+1. **System Insights:** Reads and displays the AGL OS version number from `/etc/os-release`.
+2. **Personalization:** Displays my name, **Jian De (Jaydon)**.
+3. **Interactivity:** Provides two buttons.
+   - Button 1 logic: Triggers an image to appear upon clicking.
+   - Button 2 logic: Plays an audio clip.
+4. **Toolchain Requirements:** Use the `workspace_automation` tool for Flutter running on Ubuntu 22.04 LTS (Jammy Jellyfish).
+5. **Yocto Packaging:** Develop a custom Yocto (BitBake) layer and recipe to compile and bake the app natively into an AGL `raspberrypi5` image.
+6. **Bonus (Extra Kudos):** Exercise a native AGL API.
+
+Let's dive into how I accomplished this on the Raspberry Pi 5.
+
+***
+
+### 1. Setting up the Development Toolchain
+To develop the Flutter application for AGL, I started by setting up the environment on my Ubuntu 22.04 LTS host. AGL provides excellent support for Flutter through the `meta-flutter` Yocto layer. 
+
+For the required toolchain, I utilized `workspace-automation`. This is a sister project to `meta-flutter` that provides essential tooling to set up a matching SDK environment, complete with VSCode integration. This allowed me to develop and test the Flutter UI logic on my desktop before cross-compiling it for the target embedded device. 
+
+### 2. Developing the Flutter Application
+Using Dart and the Flutter framework, I built the core requirements of the quiz:
+*   **System Insights & Personalization:** Using Dart's native `dart:io` library, I wrote a function to parse `/etc/os-release` and extract the `PRETTY_NAME` and `VERSION` fields. I displayed this alongside a personalized welcome banner for **Jian De (Jaydon)** using standard Flutter `Text` widgets.
+*   **Interactivity:** I implemented a reactive UI using Flutter's state management. The first button toggles a boolean state variable to trigger the display of an embedded image asset. The second button initiates an audio clip. Under the hood, AGL utilizes the PipeWire daemon and WirePlumber for audio routing and playback, so ensuring the Flutter app interfaces correctly with the underlying Linux audio subsystems was key.
+
+### 3. Flutter Code Deep Dive: The Logic Behind the Quiz
+
+Let's take a look at the actual Dart code used to implement the quiz requirements. The full source code is available on GitHub: [AGL-2026-Flutter-Quiz](https://github.com/jaydon2020/AGL-2026-Flutter-Quiz).
+
+#### Parsing `/etc/os-release` for System Insights
+To display the AGL OS version, I parsed the `/etc/os-release` file. This file contains key-value pairs describing the operating system.
+
+```dart
+Future<void> _readOsVersion() async {
+  try {
+    final file = File('/etc/os-release');
+    if (await file.exists()) {
+      final lines = await file.readAsLines();
+      for (final line in lines) {
+        if (line.startsWith('PRETTY_NAME=')) {
+          setState(() {
+            _osVersion = line.substring(12).replaceAll('"', ''); // Extracts AGL version
+          });
+          return;
+        }
+      }
+    }
+  } catch (e) {
+    debugPrint('Error reading OS version: $e');
+  }
+}
+```
+
+#### Implementing Interactivity: Image and Audio
+The interactivity requirements (buttons for image and audio) were handled via Flutter's reactive state and a bit of native bridging for the audio.
+
+**Image Toggle:**
+```dart
+bool _showImage = false;
+
+void _toggleImage() {
+  setState(() {
+    _showImage = !_showImage;
+  });
+}
+
+// In the UI (build method):
+// if (_showImage) Image.asset('assets/agl_logo.png', height: 200)
+```
+
+**Native Audio via MethodChannel:**
+Since AGL uses PipeWire, I utilized a `MethodChannel` to communicate with a native C++ backend for robust audio playback. This involved extracting an asset to a temporary directory so the native player could access it.
+
+```dart
+Future<void> _playSound() async {
+  // Extract asset to temp file for native playback
+  final byteData = await rootBundle.load('assets/sound.mp3');
+  final tempDir = await getTemporaryDirectory();
+  final tempFile = File('${tempDir.path}/sound.mp3');
+  await tempFile.writeAsBytes(byteData.buffer.asUint8List());
+
+  // Invoke native player via MethodChannel
+  await _audioChannel.invokeMethod('resume', {'playerId': _playerId, 'url': tempFile.path});
+}
+```
+
+#### Bonus: Connecting to KUKSA.val
+For the KUKSA.val integration, I used the `kuksa_val` Dart package to subscribe to the vehicle speed signal. The app connects to the databroker running on the Raspberry Pi (or the shared host IP).
+
+```dart
+void _initKuksaConnection() async {
+  _client = kuksa_val.VALClient(widget.kuksa.channel);
+  final request = kuksa_val.SubscribeRequest(
+    entries: [
+      kuksa_val.SubscribeEntry(
+        path: 'Vehicle.Speed',
+        view: kuksa_types.View.VIEW_CURRENT_VALUE,
+        fields: [kuksa_types.Field.FIELD_VALUE],
+      ),
+    ],
+  );
+  
+  final responseStream = _client.subscribe(request, options: widget.kuksa.authOptions);
+  responseStream.listen((response) {
+    for (var update in response.updates) {
+      if (update.entry.path == 'Vehicle.Speed') {
+        setState(() { 
+          _currentSpeed = update.entry.value.float; 
+        });
+      }
+    }
+  });
+}
+```
+
+### 4. The Bonus: Exercising a Native AGL API over Ethernet
+For the extra kudos, I chose to integrate the app with the **KUKSA.val Databroker**. KUKSA.val is an Eclipse project that enables software-defined vehicle architectures by implementing the COVESA Vehicle Signal Specification (VSS). 
+
+To fully test this on physical hardware, I wanted to manipulate the vehicle signals from my Ubuntu PC over an Ethernet connection while the app ran on the Raspberry Pi 5. By default, the KUKSA server might only listen locally. To allow external network connections from the host machine running the AGL Demo Control Panel, the Databroker must be configured to listen on all interfaces. 
+
+#### Step-by-Step Configuration for Ethernet Connectivity
+
+**Step 1: Configure Ubuntu to assign an IP (Internet Connection Sharing)**
+1. Open your Ubuntu **Settings** and go to the **Network** tab.
+2. Under the "Wired" section, look for the connection corresponding to **`enp3s0`** and click the **Gear (⚙️) icon** next to it.
+3. Go to the **IPv4** tab.
+4. Change the IPv4 Method from "Automatic (DHCP)" to **"Shared to other computers"**.
+5. Click **Apply**.
+6. Toggle the wired connection off and back on again to apply the setting.
+
+_What this does:_ Ubuntu will immediately assign itself an IP address (usually `10.42.0.1`) and start a lightweight DHCP server. It will detect the Raspberry Pi on the other end of the cable and automatically assign it an AGL-compatible IP address.
+
+**Step 2: Find the Raspberry Pi's IP**
+Launch a terminal on your host and run:
+```bash
+ip neigh show dev enp3s0
+```
+
+**Step 3: Enable Remote Access for KUKSA**
+Edit `/etc/default/kuksa-databroker` on the Raspberry Pi:
+```bash
+KUKSA_DATABROKER_ADDR=0.0.0.0
+```
+Then restart the databroker or reboot.
+
+### 5. Yocto Packaging: Creating the Custom Layer and Recipe
+To bake the app natively into an AGL image, I needed to create a custom Yocto BitBake layer (e.g., `meta-jaydon`) and a recipe.
+
+AGL includes an application launcher service called `applaunchd` that enumerates and executes installed applications. To ensure my Flutter app integrated seamlessly with this launcher and the AGL compositor, I wrote my recipe to inherit the `agl-app` BitBake class. 
+
+Inside my recipe, I specified:
+```bitbake
+inherit agl-app
+AGL_APP_TEMPLATE = "agl-app-flutter"
+AGL_APP_ID = "jaydon-quiz-app"
+```
+By setting `AGL_APP_TEMPLATE` to `agl-app-flutter`, the build system automatically generates the necessary `systemd` template units specific to Flutter graphical applications. I also made sure my application set its Wayland application ID to match the identifier in the systemd unit filename, which is critical for the AGL compositor to properly display the window.
+
+### 6. Baking and Deploying the Image for Raspberry Pi 5
+With the recipe ready, I initialized my AGL build environment for the `raspberrypi5` target machine. 
+
+I ran the AGL setup script from the master branch, making sure to include the `agl-demo` and `agl-flutter` features:
+```bash
+source meta-agl/scripts/aglsetup.sh -m raspberrypi5 -b build-pi5 agl-demo agl-flutter
+```
+
+I appended my custom package to the image install list and initiated the build for the Flutter IVI demo image using BitBake:
+```bash
+bitbake agl-ivi-demo-flutter
+```
+
+Once the build was complete, deploying the AGL demo image consists of copying the image to a MicroSD card. I extracted the generated `.wic.xz` image file and flashed it directly to my SD card using `xzcat` and `dd`:
+```bash
+xzcat tmp/deploy/images/raspberrypi5/agl-ivi-demo-flutter-raspberrypi5.rootfs-20260305003806.wic.xz | sudo dd of=/dev/sda bs=4M status=progress
+```
+
+### 7. Headless Setup & Debugging (Without a Screen)
+What if you don't have a micro-HDMI cable or an external monitor handy? You can still verify and debug your AGL image.
+
+#### Remote Display with RDP
+To view the GUI without a screen, you can use Remote Desktop Protocol (RDP). Ensure your Yocto image includes `weston-remote-display` or similar RDP components. Once connected to the network, you can use an RDP client on your laptop to view the graphical output of the Raspberry Pi.
+
+#### SSH for Remote Shell
+SSH is enabled by default as `root` in most AGL development builds. Use the IP address discovered in the networking step to login:
+```bash
+ssh root@10.42.0.X
+```
+This is essential for checking logs, modifying configurations, or manually starting the Flutter application for debugging.
+
+#### Serial UART Debugging
+For low-level boot logs and when networking is not yet configured, a Serial UART connection is your best friend. 
+1. Connect a USB-to-TTL Serial cable to the Raspberry Pi 5's debug pins.
+2. On your Ubuntu host, use `minicom` or `picocom` to access the serial console:
+```bash
+sudo minicom -D /dev/ttyUSB0 -b 115200
+```
+This provides immediate access to the early boot console and the login prompt.
+
+***
+
+By following these steps, I was able to bridge the gap between high-level Flutter development and low-level Yocto system integration, culminating in a functional application running on real Automotive Grade Linux hardware. Happy tinkering!
