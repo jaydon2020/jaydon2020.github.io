@@ -126,7 +126,7 @@ const experience: ExperienceItem[] = [
               Read the blog
               <Icon name="lucide:arrow-right" class="size-4" />
             </Link>
-            <Link href="/about" class={buttonVariants({ variant: 'outline', size: 'lg' })}>
+            <Link href={SOCIAL_LINKS.find(link => link.label === 'GitHub')?.href ?? 'https://github.com/jaydon2020'} class={buttonVariants({ variant: 'outline', size: 'lg' })}>
               <Icon name="lucide:github" class="size-4" />
               Github
             </Link>
