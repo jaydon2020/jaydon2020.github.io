@@ -162,10 +162,10 @@ const { title, variant = 'note', defaultOpen = true, ...rest } = Astro.props
     class="flex cursor-pointer items-center font-medium [&::-webkit-details-marker]:hidden"
   >
     <Icon
-      name={calloutConfig[variant]?.icon || calloutConfig.note.icon}
-      class={cn('mr-2 size-4 shrink-0', calloutConfig[variant]?.textColor || calloutConfig.note.textColor)}
+      name={calloutConfig[variant].icon}
+      class={cn('mr-2 size-4 shrink-0', calloutConfig[variant].textColor)}
     />
-    <span class={cn('font-medium mr-2', calloutConfig[variant]?.textColor || calloutConfig.note.textColor)}>
+    <span class={cn('font-medium mr-2', calloutConfig[variant].textColor)}>
       {capitalize(variant)}
       {title && <span class="font-normal opacity-70"> ({title})</span>}
     </span>
@@ -173,7 +173,7 @@ const { title, variant = 'note', defaultOpen = true, ...rest } = Astro.props
       name="lucide:chevron-down"
       class={cn(
         'ml-auto h-4 w-4 shrink-0 transition-transform duration-200',
-        calloutConfig[variant]?.textColor || calloutConfig.note.textColor,
+        calloutConfig[variant].textColor,
       )}
     />
   </summary>
