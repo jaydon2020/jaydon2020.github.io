@@ -1,0 +1,124 @@
+---
+title: "Porting ReSpeaker 2-Mics Pi HAT v2 to BeagleY-AI"
+description: "A comprehensive guide to porting the Seeed Studio ReSpeaker 2-Mics Pi HAT v2 (TLV320AIC3104) to the BeagleY-AI SBC."
+date: 2025-05-10
+tags: ["BeagleY-AI", "ALSA", "TLV320AIC3104", "SeeedStudio", "Hardware"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+**REVISED MAY 2025**
+
+<Callout variant="warning">
+This guide is specifically for the **ReSpeaker 2-Mics Pi HAT v2**. To distinguish between v1 and v2 hardware, please refer to [How to Distinguish ReSpeaker 2-Mics Pi HAT Hardware Revisions](https://wiki.seeedstudio.com/how-to-distinguish-respeaker_2-mics_pi_hat-hardware-revisions/).
+</Callout>
+
+## Hardware Overview
+
+### 1. BeagleY-AI
+![BeagleY-AI](https://docs.beagleboard.org/_images/beagley-ai.webp)
+
+BeagleY® AI is an open-source single board computer designed to simplify the process of building smart human machine interfaces (HMI), adding cameras and high-speed connectivity to a reliable embedded system. It features a quad-core A53 processor, AI accelerators, and modern connectivity.
+
+### 2. ReSpeaker 2-Mics Pi HAT v2
+<Callout variant="note">
+The ReSpeaker 2-Mics Pi HAT has been upgraded to version 2.0. The codec chip has been replaced from WM8960 to **TLV320AIC3104**, enabling support for Raspberry Pi 5 / BeagleY-AI and expanding the sampling rate range up to 96 kHz.
+</Callout>
+
+![ReSpeaker](https://media-cdn.seeedstudio.com/media/catalog/product/cache/bb49d3ec4ee05b6f018e93f896b8a25d/0/4/04_8_1.png)
+
+## Setup Process
+
+### 1. Bootable SD Card Preparation
+Create a bootable microSD card with the latest OS image for BeagleY-AI. See the [BeagleY-AI Quick Start](https://docs.beagleboard.org/boards/beagley/ai/02-quick-start.html) for details.
+
+### 2. Kernel Driver Compilation
+<Callout variant="note">
+BeagleY-AI typically includes the `tlv320aic31xx` codec driver. Run `sudo apt update && sudo apt upgrade` first. If `snd-soc-tlv320aic31xx.ko.xz` is missing, you'll need to build it from source.
+</Callout>
+
+```bash
+cd linux
+
+# default configuration
+make distclean
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bb.org_defconfig
+
+# enable codec in menuconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- menuconfig
+# -> Device Drivers -> Sound card support -> ALSA for SoC audio support -> CODEC drivers
+# Set "Texas Instruments TLV320AIC31xx CODECs" to module <M>
+
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image dtbs modules LOCALVERSION="-ti-arm64-r23" -j$(nproc)
+```
+
+**Install onto the SD card**:
+```bash
+sudo cp arch/arm64/boot/Image /media/$(users)/BOOT/
+sudo cp arch/arm64/boot/dts/ti/*.dtbo /media/$(users)/BOOT/overlays/
+sudo cp -ra modules/lib/modules/$(make kernelversion)-ti-arm64-r23/ /media/$(users)/rootfs/lib/modules/
+sync
+```
+
+## Device Tree Configuration
+
+**Get compiled Device Tree Source (DTS)**:
+```bash
+curl https://raw.githubusercontent.com/jaydon2020/ReSpeaker-2-Mics-Pi-HAT-v2-BeagleY-AI/refs/heads/main/overlays/k3-am67a-beagley-ai-respeaker.dtbo -o k3-am67a-beagley-ai-respeaker.dtbo
+sudo mv k3-am67a-beagley-ai-respeaker.dtbo /boot/firmware/overlays/
+```
+
+**Load Device Tree Configuration**:
+Edit `/boot/firmware/extlinux/extlinux.conf`:
+```text
+label microSD (default)
+    kernel /Image
+    append console=ttyS2,115200n8 root=/dev/mmcblk1p3 ro rootfstype=ext4 resume=/dev/mmcblk1p2 rootwait net.ifnames=0 quiet
+    fdtdir /
+    fdt /ti/k3-am67a-beagley-ai.dtb
+    fdtoverlays /overlays/k3-am67a-beagley-ai-respeaker.dtbo /overlays/k3-am67a-beagley-ai-spidev0.dtbo
+    initrd /initrd.img
+```
+
+```bash
+sudo reboot -f
+```
+
+## Basic Recording & Playback
+
+Helpful commands for testing:
+```bash
+# Record mono (plughw handles stereo-to-mono conversion)
+arecord -D plughw:0,0 --format S16_LE --rate 16000 --channels 1 --duration 5 test_mono.wav
+
+# Record stereo
+arecord -D hw:0,0 --format S16_LE --rate 48000 --channels 2 --duration 5 test_stereo.wav
+
+# Playback
+aplay -D hw:0,0 test_stereo.wav
+```
+
+### Record Sound with Python
+```bash
+git clone https://github.com/jaydon2020/ReSpeaker-2-Mics-Pi-HAT-v2-BeagleY-AI.git 
+cd ReSpeaker-2-Mics-Pi-HAT-v2-BeagleY-AI
+sudo apt-get install portaudio19-dev libatlas-base-dev
+python3 recordings/detect_microphone.py
+# Set RESPEAKER_INDEX in your script, then:
+python3 recordings/record_stereo.py
+```
+
+## On-board User LEDs and Button
+```bash
+sudo apt update
+sudo apt install python3-libgpiod python3-spidev
+python interfaces/pixels.py # Test LEDs
+python interfaces/button.py # Test button
+```
+
+## References
+1. [ReSpeaker 2-Mics Pi HAT Product Page](https://www.seeedstudio.com/ReSpeaker-2-Mics-Pi-HAT.html)
+2. [BeagleY-AI Documentation](https://docs.beagleboard.org/boards/beagley/ai/index.html)
+3. [Hackster Post: Porting ReSpeaker to BeagleY-AI](https://www.hackster.io/jaydon-msia/porting-the-respeaker-2-mics-pi-hat-v2-to-beagley-ai-6dd8f2)

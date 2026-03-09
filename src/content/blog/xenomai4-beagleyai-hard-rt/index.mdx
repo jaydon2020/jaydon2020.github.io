@@ -1,0 +1,158 @@
+---
+title: "Integrating Xenomai 4 on BeagleY-AI: Hard Real-Time Linux"
+description: "A deep dive into setting up Xenomai 4 EVL on the BeagleY-AI for sub-10μs latency and deterministic performance."
+date: 2025-05-28
+tags: ["BeagleY-AI", "Linux Kernel", "Xenomai4", "Real-Time", "EVL"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+## Why Xenomai?
+
+While Preempt-RT provides soft real-time capabilities, **Xenomai 4** delivers **hard real-time performance** via its EVL (Evolvable Linux) core. This dual-kernel approach achieves:  
+- **Sub-10μs latency** for time-critical tasks  
+- **Deterministic interrupt handling**  
+- **Coexistence** of real-time and Linux applications  
+
+---
+
+## Prerequisites
+
+1. **BeagleY-AI** running [Debian 12.11 2025-05-21 XFCE](https://www.beagleboard.org/distros/beagley-ai-debian-12-11-2025-05-21-xfce-v6-6-x-ti)
+2. **Host Machine**: Ubuntu 22.04+ (64-bit) with ARM cross-compiler  
+
+---
+
+## Step 1: Obtain Kernel Sources
+
+*(On Host Machine)*
+
+### 1.1 Clone Beagleboard’s Linux Kernel
+```bash
+git clone https://github.com/beagleboard/linux -b 6.6.58-ti-rt-arm64-r27
+cd linux
+```
+
+### 1.2 Fetch Xenomai EVL Patches
+```bash
+git remote add xenomai https://source.denx.de/Xenomai/xenomai4/linux-evl.git
+git fetch xenomai v6.6.y-evl-rebase
+```
+
+## Step 2: Merge EVL into TI Kernel
+
+### 2.1 Create a Merge Branch
+```bash
+git checkout -b ti-xenomai-merge
+git merge xenomai/v6.6.y-evl-rebase
+```
+
+### 2.2 Resolve Merge Conflicts
+Focus on:  
+- **`arch/arm64`**: TI-specific changes vs. Xenomai’s EVL modifications.
+- **`drivers/`**: SPI, PWM, or Ethernet drivers.
+- **`kernel/sched`**: Scheduler conflicts between RT and EVL.
+
+---
+
+## Step 3: Configure the Kernel
+
+### 3.1 Start with BeagleY’s Default Config
+```bash
+make distclean
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bb.org_defconfig
+```
+
+### 3.2 Enable Xenomai EVL
+```bash
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- menuconfig
+```
+**Key Options**:  
+```text
+-> Kernel Features
+    -> [*] EVL real-time core
+        [*]   Enable quota-based scheduling 
+        [*]   Enable temporal partitioning policy
+        (4)     Number of partitions
+        [*]   Collect runtime statistics
+```
+
+---
+
+## Step 4: Build the Kernel
+
+### 4.1 Compile Kernel & Modules
+```bash
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION="-xenomai" -j$(nproc)
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=./modules modules_install
+```
+
+### 4.2 Package Artifacts
+```bash
+tar -czf xenomai-kernel-6.6.69-xenomai.tar.gz arch/arm64/boot/Image modules/lib/modules/6.6.69-xenomai
+```
+
+---
+
+## Step 5: Deploy EVL Kernel
+
+*(On BeagleY-AI)*
+
+1. Copy `Image` to `/BOOT/`.
+2. Extract modules to `/lib/modules`.
+3. Update `/boot/firmware/extlinux/extlinux.conf`:
+```text
+label microSD (default)
+    kernel /Image
+    append console=ttyS2,115200n8 root=/dev/mmcblk1p3 ro rootfstype=ext4 resume=/dev/mmcblk1p2 rootwait net.ifnames=0 quiet
+    fdtdir /
+    fdt /ti/k3-am67a-beagley-ai.dtb
+    fdtoverlays /overlays/k3-am67a-beagley-ai-csi0-tevs-rpi22.dtbo
+    initrd /initrd.img
+```
+
+Verify the kernel version:
+```bash
+$ uname -r
+6.6.69-xenomai
+```
+
+---
+
+## Step 6: Build & Install Xenomai Libraries
+
+*(Native on BeagleY-AI)*
+
+### 6.1 Clone Source
+```bash  
+mkdir ~/xenomai && cd ~/xenomai  
+git clone https://source.denx.de/Xenomai/xenomai4/libevl.git  
+git clone https://source.denx.de/Xenomai/xenomai4/linux-evl.git --depth=1 --branch v6.6.y-evl-rebase  
+```
+
+### 6.2 Build libevl
+```bash  
+mkdir build && cd build  
+meson setup -Dbuildtype=release -Dprefix=/usr -Duapi=~/xenomai/linux-evl ../libevl  
+meson compile  
+sudo ninja install  
+```
+
+### 6.3 Validate with EVL test
+```bash
+sudo evl test
+```
+**Expected Output**:  
+`basic-xbuf: OK`, `clock-timer-periodic: OK`, `clone-fork-exec: OK`, etc.
+
+---
+
+## Conclusion
+Setting up Xenomai 4 on the BeagleY-AI provides a solid foundation for ultra-low latency audio and robotics applications. By merging the TI vendor kernel with the EVL core, we get the best of both worlds: full hardware support and hard real-time guarantees.
+
+## References
+1. [Xenomai Official Documentation](https://xenomai.org/documentation/)  
+2. [EVL Kernel Patches](https://source.denx.de/Xenomai/xenomai4/linux-evl)  
+3. [Real-Time Linux Projects (OSADL)](https://www.osadl.org/Realtime-Linux.projects-realtime-linux.0.html)
