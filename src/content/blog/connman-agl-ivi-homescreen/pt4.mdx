@@ -1,0 +1,319 @@
+---
+title: "ConnMan on AGL ivi-homescreen, Part 4: The Agent, promise/future Bridge & Flutter UI"
+description: "How the ConnMan Agent bridges network credential requests from the D-Bus thread across to a Flutter password dialog using std::promise/future, and how the event-driven Dart client ties everything together."
+date: 2026-03-13
+tags: ["AGL", "Flutter", "ConnMan", "D-Bus", "ivi-homescreen", "C++", "Dart", "Embedded Linux"]
+draft: false
+authors: ['jiande']
+order: 4
+---
+
+import Callout from '@/components/Callout.astro'
+
+In [Part 3](/blog/connman-agl-ivi-homescreen/pt3) we covered the Wi-Fi technology and service operations using sdbus-c++. In this final part we tackle the most architecturally interesting component: the **ConnMan Agent**.
+
+When ConnMan needs to connect to a WPA2 network, it cannot simply proceed — it needs the user's passphrase. ConnMan gets it by calling a D-Bus agent that the client application registers. Our agent must bridge that D-Bus call (on the D-Bus event loop thread) across to a Flutter UI dialog (on the Flutter platform thread) and then return the result synchronously back to ConnMan. This part explains exactly how we do that using `std::promise/future`.
+
+---
+
+## The ConnMan Agent Protocol
+
+ConnMan's `net.connman.Agent` interface specifies four methods:
+
+| Method | When Called |
+|---|---|
+| `RequestInput(service, fields)` | ConnMan needs credentials (passphrase, etc.) |
+| `ReportError(service, error)` | ConnMan reports a connection failure |
+| `RequestBrowser(service, url)` | Captive portal — open a browser (Wi-Fi hotspot login) |
+| `Release()` | ConnMan is releasing the agent |
+| `Cancel()` | In-progress `RequestInput` cancelled |
+
+Of these, `RequestInput` is the one that matters most for Wi-Fi. It is a **synchronous D-Bus method** — ConnMan blocks, waiting for the return value, which should be a `map<string, Variant>` containing the credentials.
+
+---
+
+## Registering the Agent Object
+
+In `connman_agent.cc`, the constructor creates a D-Bus object at path `/net/connman/flutter_agent` and registers all the methods of the `net.connman.Agent` interface:
+
+```cpp
+ConnmanAgent::ConnmanAgent(
+    flutter::MethodChannel<flutter::EncodableValue>* channel)
+    : channel_(channel) {
+  auto& sysBus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+  agent_object_ = sdbus::createObject(sysBus, sdbus::ObjectPath(kAgentPath));
+
+  agent_object_
+      ->addVTable(
+          sdbus::registerMethod("Release").implementedAs(
+              [this]() { Release(); }),
+          sdbus::registerMethod("ReportError")
+              .withInputParamNames("service", "error")
+              .implementedAs([this](const sdbus::ObjectPath& svc,
+                                   const std::string& err) {
+                ReportError(svc, err);
+              }),
+          sdbus::registerMethod("RequestBrowser")
+              .withInputParamNames("service", "url")
+              .implementedAs([this](const sdbus::ObjectPath& svc,
+                                   const std::string& url) {
+                RequestBrowser(svc, url);
+              }),
+          sdbus::registerMethod("RequestInput")
+              .withInputParamNames("service", "fields")
+              .withOutputParamNames("inputs")
+              .implementedAs(
+                  [this](const sdbus::ObjectPath& svc,
+                         const std::map<std::string, sdbus::Variant>& flds) {
+                    return RequestInput(svc, flds);
+                  }),
+          sdbus::registerMethod("Cancel").implementedAs(
+              [this]() { Cancel(); }))
+      .forInterface("net.connman.Agent");
+
+  // Tell ConnMan about our agent
+  auto mgr = sdbus::createProxy(sysBus, "net.connman", "/");
+  mgr->callMethod("RegisterAgent")
+      .onInterface("net.connman.Manager")
+      .withArguments(sdbus::ObjectPath(kAgentPath));
+}
+```
+
+When the plugin is destroyed, the destructor calls `UnregisterAgent` to cleanly remove the agent from ConnMan.
+
+---
+
+## The Threading Challenge
+
+`RequestInput` is where things get complex. Here is the situation:
+
+```
+D-Bus event loop thread:
+  ConnMan → calls net.connman.Agent.RequestInput
+  Our C++ handler must RETURN the passphrase synchronously
+
+Flutter platform thread:
+  Flutter dialog must be shown and awaited for the user to type the passphrase
+```
+
+We cannot show a Flutter dialog from the D-Bus thread — `MethodChannel::InvokeMethod` must be called from the Flutter platform thread. But we cannot block the Flutter platform thread to wait for the result, because that would deadlock (the platform thread processes the dialog callbacks).
+
+The solution is `std::promise/future`:
+
+1. Create a `promise<map<string, Variant>>` on the **D-Bus thread**.
+2. Get the corresponding `future` from the promise, also on the D-Bus thread.
+3. Call `InvokeMethod("requestInput", ...)` on the **Flutter platform thread** (MethodChannel dispatches onto it internally).
+4. Set up success/error callbacks that **resolve the promise**.
+5. **Block the D-Bus thread** on `future.get()` — waiting for the promise to be resolved.
+6. The Flutter dialog runs, the user types the passphrase, the callback fires, the promise is resolved, `future.get()` unblocks, and we return the credentials to ConnMan.
+
+---
+
+## RequestInput Implementation
+
+```cpp
+std::map<std::string, sdbus::Variant> ConnmanAgent::RequestInput(
+    const sdbus::ObjectPath& service,
+    const std::map<std::string, sdbus::Variant>& fields) {
+
+  // Step 1: Create the promise/future pair on the D-Bus thread.
+  auto promise = std::make_shared<
+      std::promise<std::map<std::string, sdbus::Variant>>>();
+  auto future = promise->get_future();
+
+  // Step 2: Build the argument map to send to Dart.
+  //         Tell Dart which fields ConnMan needs (e.g. "Passphrase").
+  flutter::EncodableMap dart_fields;
+  for (const auto& pair : fields) {
+    dart_fields[flutter::EncodableValue(pair.first)] =
+        flutter::EncodableValue(pair.first);
+  }
+  flutter::EncodableMap args;
+  args[flutter::EncodableValue("service")] =
+      flutter::EncodableValue(service.c_str());
+  args[flutter::EncodableValue("fields")] =
+      flutter::EncodableValue(dart_fields);
+
+  // Step 3: Invoke "requestInput" on the Flutter MethodChannel.
+  //         This schedules execution on the Flutter platform thread.
+  channel_->InvokeMethod(
+      "requestInput",
+      std::make_unique<flutter::EncodableValue>(std::move(args)),
+      std::make_unique<flutter::MethodResultFunctions<flutter::EncodableValue>>(
+          // Success callback: Dart returned {"Passphrase": "s3cr3t"}
+          [promise](const flutter::EncodableValue* success) {
+            std::map<std::string, sdbus::Variant> result;
+            if (success &&
+                std::holds_alternative<flutter::EncodableMap>(*success)) {
+              for (const auto& kv :
+                   std::get<flutter::EncodableMap>(*success)) {
+                if (std::holds_alternative<std::string>(kv.first) &&
+                    std::holds_alternative<std::string>(kv.second)) {
+                  result[std::get<std::string>(kv.first)] =
+                      sdbus::Variant(std::get<std::string>(kv.second));
+                }
+              }
+              promise->set_value(std::move(result));
+            } else {
+              // No result? Treat as cancelled.
+              promise->set_exception(std::make_exception_ptr(sdbus::Error(
+                  sdbus::Error::Name("net.connman.Agent.Error.Canceled"),
+                  "User canceled input request")));
+            }
+          },
+          // Error callback: user cancelled or dialog failed
+          [promise](const std::string& /*code*/, const std::string& msg,
+                    const flutter::EncodableValue* /*details*/) {
+            promise->set_exception(std::make_exception_ptr(sdbus::Error(
+                sdbus::Error::Name("net.connman.Agent.Error.Canceled"), msg)));
+          },
+          // NotImplemented
+          [promise]() {
+            promise->set_exception(std::make_exception_ptr(sdbus::Error(
+                sdbus::Error::Name("net.connman.Agent.Error.Canceled"),
+                "requestInput not implemented")));
+          }));
+
+  // Step 4: Block the D-Bus thread until Dart responds.
+  try {
+    return future.get();
+  } catch (const sdbus::Error&) {
+    throw;  // Re-throw net.connman.Agent.Error.Canceled to ConnMan
+  } catch (...) {
+    throw sdbus::Error(
+        sdbus::Error::Name("net.connman.Agent.Error.Canceled"),
+        "Unknown error requesting input from Flutter");
+  }
+}
+```
+
+<Callout variant="note">
+The `promise` is a `shared_ptr` because the lambda callbacks extend their lifetime beyond the scope of `RequestInput`. The D-Bus thread holds a reference (through `future.get()`), and the Flutter platform thread holds another reference through the lambdas.
+</Callout>
+
+When the user cancels (taps Cancel in the dialog), the Dart side throws a `PlatformException` with code `CANCELLED` — this triggers the error callback, which sets an exception on the promise, causing `future.get()` to throw the `sdbus::Error`, which propagates back to ConnMan as an agent cancellation.
+
+---
+
+## The Dart Side: ConnmanService
+
+On the Flutter/Dart side, `ConnmanService` in `lib/connman_service.dart` handles the incoming `requestInput` call:
+
+```dart
+class ConnmanService {
+  static const MethodChannel _channel = MethodChannel('io.github.jaydon2020');
+
+  /// Set this callback before using ConnmanService.
+  static Future<Map<String, String>?> Function(
+    String service,
+    List<String> fields,
+  )? onRequestInput;
+
+  static void init() {
+    _channel.setMethodCallHandler(_handleMethodCall);
+  }
+
+  static Future<dynamic> _handleMethodCall(MethodCall call) async {
+    if (call.method == 'requestInput') {
+      final args = Map<String, dynamic>.from(call.arguments as Map);
+      final service = args['service'] as String? ?? '';
+      final fieldsMap = args['fields'] as Map? ?? {};
+      final fields = fieldsMap.keys.cast<String>().toList();
+
+      if (onRequestInput != null) {
+        final result = await onRequestInput!(service, fields);
+        if (result != null) {
+          return result;  // {"Passphrase": "..."}
+        }
+      }
+      // Returning null or throwing causes C++ to cancel.
+      throw PlatformException(
+        code: 'CANCELLED',
+        message: 'User cancelled credential input',
+      );
+    }
+    throw MissingPluginException('no handler for ${call.method}');
+  }
+}
+```
+
+The callback pattern (`onRequestInput`) decouples the service layer from the UI layer — the widget registers its dialog function, and the service calls it.
+
+---
+
+## The Event-Driven Dart UI
+
+The main `WifiPage` widget uses the EventChannel to receive live updates instead of polling:
+
+```dart
+@override
+void initState() {
+  super.initState();
+  ConnmanService.onRequestInput = _showPasswordDialog;
+  _initSystemWifi();
+}
+
+Future<void> _initSystemWifi() async {
+  // Unblock the radio on AGL (rfkill may soft-block it by default)
+  await Process.run('rfkill', ['unblock', 'wifi']);
+  await Process.run('ip', ['link', 'set', 'wlan0', 'up']);
+
+  // Subscribe BEFORE the first poll to avoid missing events
+  _eventSub = _eventChannel.receiveBroadcastStream().listen(_onEvent);
+
+  await _refreshWifiStatus();
+}
+
+void _onEvent(dynamic raw) {
+  if (raw is! Map) return;
+  final event = Map<String, dynamic>.from(raw);
+  final type = event['type'] as String? ?? '';
+
+  if (type == 'servicesChanged') {
+    final rawList = event['services'] as List? ?? [];
+    setState(() {
+      _isBusy = false;
+      _wifiServices = rawList
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      _isConnected = _wifiServices
+          .any((s) => s['state'] == 'ready' || s['state'] == 'online');
+    });
+  } else if (type == 'technologyChanged') {
+    setState(() {
+      _isBusy = false;
+      if (event['powered'] != null) _isWifiPowered = event['powered'] as bool;
+      if (event['connected'] != null) _isConnected = event['connected'] as bool;
+      if (!_isWifiPowered) _wifiServices = [];
+    });
+  }
+}
+```
+
+---
+
+## Article Series Roadmap
+
+| Part | Topic |
+|---|---|
+| **Part 1** | [AGL architecture overview, ConnMan D-Bus API, plugin design](/blog/connman-agl-ivi-homescreen) |
+| **Part 2** | [Plugin registration, MethodChannel dispatch, EventChannel wiring in C++](/blog/connman-agl-ivi-homescreen/pt2) |
+| **Part 3** | [D-Bus operations: Technology and Service modules with sdbus-c++](/blog/connman-agl-ivi-homescreen/pt3) |
+| **Part 4** *(this article)* | The ConnMan Agent: bridging D-Bus callbacks to Flutter dialogs |
+
+Across this four-part series we've covered the complete implementation of a ConnMan Flutter plugin for AGL ivi-homescreen:
+
+1. **Thin dispatcher** — `connman_plugin.cc` owns channels and routing; D-Bus logic is encapsulated in dedicated modules.
+2. **Background threads** — blocking D-Bus calls (`Connect`, `Scan`, `SetProperty`) run on detached threads to keep the Flutter platform thread responsive.
+3. **Event-driven** — D-Bus `PropertyChanged` and `ServicesChanged` signals drive UI updates; no polling needed.
+4. **Promise/future bridge** — enables synchronous D-Bus callbacks to cross thread boundaries safely to a Flutter dialog.
+
+---
+
+## References
+
+- [ConnMan Agent API](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc/agent-api.txt)
+- [sdbus-c++ creating objects](https://github.com/Kistler-Group/sdbus-cpp/blob/master/docs/using-sdbus-c++.md)
+- [Flutter MethodChannel (desktop)](https://api.flutter.dev/flutter/services/MethodChannel-class.html)
+- [flutter::EventChannel C++ header](https://github.com/flutter/engine/blob/main/shell/platform/common/client_wrapper/include/flutter/event_channel.h)
+- [connman-glib (AGL reference)](https://github.com/AGL-ic-eg/connman-glib)

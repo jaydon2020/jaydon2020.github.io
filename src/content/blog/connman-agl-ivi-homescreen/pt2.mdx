@@ -1,0 +1,314 @@
+---
+title: "ConnMan on AGL ivi-homescreen, Part 2: Plugin Registration & Channel Wiring"
+description: "Deep dive into how the ConnMan Flutter plugin registers with ivi-homescreen, wires up a MethodChannel for RPC calls, and sets up an EventChannel for D-Bus signal streaming."
+date: 2026-03-11
+tags: ["AGL", "Flutter", "ConnMan", "D-Bus", "ivi-homescreen", "C++", "Embedded Linux"]
+draft: false
+authors: ['jiande']
+order: 2
+---
+
+import Callout from '@/components/Callout.astro'
+
+In [Part 1](/blog/connman-agl-ivi-homescreen) we covered the big picture: what ConnMan is, how AGL's ivi-homescreen plugin architecture works, and the overall design of the plugin. In this part we zoom into the C++ side — specifically `connman_plugin.cc` — and understand exactly how a plugin registers with Flutter, handles method calls, and streams D-Bus events up to Dart.
+
+---
+
+## The ivi-homescreen Plugin Entry Point
+
+Every plugin must expose a **C linkage entry point** that matches the ABI expected by the embedder. For ivi-homescreen (which uses the standard Flutter desktop plugin API), this is a function named after the plugin:
+
+```cpp
+// connman_plugin.h
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void connman_plugin_register_with_registrar(
+    FlutterDesktopPluginRegistrarRef registrar);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+The embedder calls this function at startup, passing a `FlutterDesktopPluginRegistrarRef`. In `connman_plugin.cc`, we unwrap that into a typed C++ `flutter::PluginRegistrar` and hand it to the plugin class:
+
+```cpp
+void connman_plugin_register_with_registrar(
+    FlutterDesktopPluginRegistrarRef registrar) {
+  connman_plugin::ConnmanPlugin::RegisterWithRegistrar(
+      flutter::PluginRegistrarManager::GetInstance()
+          ->GetRegistrar<flutter::PluginRegistrar>(registrar));
+}
+```
+
+This is all boilerplate — the interesting logic starts in `RegisterWithRegistrar`.
+
+---
+
+## Plugin Class Architecture
+
+The plugin is implemented as a C++ class that extends `flutter::Plugin`. It owns:
+
+- A `flutter::MethodChannel` — for bidirectional RPC with Dart.
+- A `flutter::EventChannel` — for streaming D-Bus signals to Dart.
+- A `ConnmanAgent` — the D-Bus object that ConnMan calls when it needs credentials.
+- A `std::mutex` + `EventSink` pair — for thread-safe event emission.
+- A `vector<unique_ptr<sdbus::IProxy>>` — proxy objects kept alive for D-Bus signal subscriptions.
+
+```cpp
+class ConnmanPlugin : public flutter::Plugin {
+ public:
+  static void RegisterWithRegistrar(flutter::PluginRegistrar* registrar);
+
+  explicit ConnmanPlugin(
+      std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel,
+      flutter::BinaryMessenger* messenger)
+      : channel_(std::move(channel)), messenger_(messenger) {
+    agent_ = std::make_unique<ConnmanAgent>(channel_.get());
+    SetupEventChannel();
+  }
+
+ private:
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
+  std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>> event_channel_;
+  flutter::BinaryMessenger* messenger_;
+  std::unique_ptr<ConnmanAgent> agent_;
+
+  std::mutex sink_mutex_;
+  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
+  std::vector<std::unique_ptr<sdbus::IProxy>> signal_proxies_;
+  // ...
+};
+```
+
+<Callout variant="tip">
+The `channel_` pointer is passed to `ConnmanAgent` so the agent can invoke Dart methods (`requestInput`) on the same channel. Both live for the lifetime of the plugin.
+</Callout>
+
+---
+
+## Registering the MethodChannel
+
+`RegisterWithRegistrar` creates the MethodChannel and wires the call handler:
+
+```cpp
+void ConnmanPlugin::RegisterWithRegistrar(flutter::PluginRegistrar* registrar) {
+  auto channel =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          registrar->messenger(), "io.github.jaydon2020",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  auto plugin = std::make_unique<ConnmanPlugin>(std::move(channel),
+                                                registrar->messenger());
+
+  plugin->channel_->SetMethodCallHandler(
+      [plugin_pointer = plugin.get()](const auto& call, auto result) {
+        plugin_pointer->HandleMethodCall(call, std::move(result));
+      });
+
+  registrar->AddPlugin(std::move(plugin));
+}
+```
+
+A few things worth noting:
+
+1. **Channel name**: `"io.github.jaydon2020"` must match exactly what the Dart side uses in `MethodChannel('io.github.jaydon2020')`.
+2. **`StandardMethodCodec`**: this codec serializes method calls and results using Flutter's standard binary format. Both C++ and Dart must use the same codec.
+3. **Ownership**: `plugin` is moved into `registrar->AddPlugin(...)`, so the registrar owns the plugin for its lifetime. The lambda captures `plugin_pointer` (a raw pointer), which is safe since the pointer lifetime is tied to the plugin's.
+
+---
+
+## Dispatching Method Calls
+
+`HandleMethodCall` is the single dispatch point for all incoming Dart calls. It is deliberately a thin router — it validates arguments and forwards to the appropriate module:
+
+```cpp
+void HandleMethodCall(
+    const flutter::MethodCall<flutter::EncodableValue>& call,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  const auto& name = call.method_name();
+
+  if (name == "getWifiTechnology") {
+    ConnmanTechnology::GetWifiTechnology(std::move(result));
+
+  } else if (name == "setWifiPowered") {
+    const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+    if (args) {
+      auto powered = GetArgument<bool>(*args, "powered");
+      if (powered.has_value()) {
+        ConnmanTechnology::SetWifiPowered(*powered, std::move(result));
+        return;
+      }
+    }
+    result->Error("INVALID_ARGUMENTS", "Expected boolean 'powered'");
+
+  } else if (name == "scanWifi") {
+    ConnmanTechnology::ScanWifi(std::move(result));
+
+  } else if (name == "getWifiServices") {
+    ConnmanService::GetWifiServices(std::move(result));
+
+  } else if (name == "connectService" || name == "disconnectService" ||
+             name == "removeService") {
+    const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+    std::optional<std::string> path;
+    if (args) path = GetArgument<std::string>(*args, "path");
+
+    if (!path.has_value() || path->empty()) {
+      result->Error("INVALID_ARGUMENTS", "Expected string 'path'");
+      return;
+    }
+    if (name == "connectService")
+      ConnmanService::ConnectService(*path, std::move(result));
+    else if (name == "disconnectService")
+      ConnmanService::DisconnectService(*path, std::move(result));
+    else
+      ConnmanService::RemoveService(*path, std::move(result));
+
+  } else {
+    result->NotImplemented();
+  }
+}
+```
+
+The `GetArgument<T>` helper (from `connman_helpers.h`) safely extracts typed values from the `EncodableMap`:
+
+```cpp
+template <typename T>
+std::optional<T> GetArgument(const flutter::EncodableMap& args,
+                              const std::string& key) {
+  auto it = args.find(flutter::EncodableValue(key));
+  if (it != args.end() && std::holds_alternative<T>(it->second)) {
+    return std::get<T>(it->second);
+  }
+  return std::nullopt;
+}
+```
+
+This is a pattern worth adopting in any plugin — it keeps argument extraction safe, concise, and type-checked without exceptions.
+
+---
+
+## Setting Up the EventChannel
+
+The EventChannel is the mechanism for **pushing unsolicited events** from C++ to Dart — perfect for D-Bus signals. It is set up in `SetupEventChannel()`:
+
+```cpp
+void SetupEventChannel() {
+  event_channel_ =
+      std::make_unique<flutter::EventChannel<flutter::EncodableValue>>(
+          messenger_, "io.github.jaydon2020/events",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  auto handler = std::make_unique<
+      flutter::StreamHandlerFunctions<flutter::EncodableValue>>(
+    // onListen: Dart subscribed
+    [this](const flutter::EncodableValue* /*args*/,
+           std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> sink) {
+      std::lock_guard<std::mutex> lock(sink_mutex_);
+      event_sink_ = std::move(sink);
+      SubscribeToSignals();
+      return nullptr;
+    },
+    // onCancel: Dart unsubscribed
+    [this](const flutter::EncodableValue* /*args*/) {
+      std::lock_guard<std::mutex> lock(sink_mutex_);
+      signal_proxies_.clear();  // stop listening to signals
+      event_sink_ = nullptr;
+      return nullptr;
+    });
+
+  event_channel_->SetStreamHandler(std::move(handler));
+}
+```
+
+The lifecycle is clean:
+- **`onListen`** fires when the Dart side calls `eventChannel.receiveBroadcastStream().listen(...)`. This is when we start subscribing to D-Bus signals and hand the `event_sink_` to the signal handlers.
+- **`onCancel`** fires when the stream subscription is cancelled. We clear the proxy objects (which stops signal delivery) and null out the sink.
+
+---
+
+## Subscribing to D-Bus Signals
+
+Once Dart is listening, `SubscribeToSignals()` creates three types of subscriptions:
+
+```cpp
+void SubscribeToSignals() {
+  try {
+    auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+
+    // 1. Manager ServicesChanged — fires when the list of services changes
+    auto mgr_proxy = sdbus::createProxy(bus, sdbus::ServiceName("net.connman"),
+                                        sdbus::ObjectPath("/"));
+    mgr_proxy->uponSignal("ServicesChanged")
+        .onInterface("net.connman.Manager")
+        .call([this](const std::vector<...>& /*changed*/,
+                     const std::vector<sdbus::ObjectPath>& /*removed*/) {
+          ConnmanService::PushServicesUpdate(sink_mutex_, event_sink_);
+        });
+    signal_proxies_.push_back(std::move(mgr_proxy));
+
+    // 2. Technology PropertyChanged — e.g. Wi-Fi powered on/off
+    ConnmanTechnology::SubscribeToPropertyChanged(
+        signal_proxies_, sink_mutex_, event_sink_);
+
+    // 3. Service PropertyChanged — e.g. state, strength
+    ConnmanService::SubscribeToPropertyChanged(
+        signal_proxies_, sink_mutex_, event_sink_);
+
+  } catch (const sdbus::Error& e) {
+    std::cerr << "Failed to subscribe to ConnMan signals: "
+              << e.getMessage() << std::endl;
+  }
+}
+```
+
+The proxy objects are stored in `signal_proxies_` to keep them alive — sdbus-c++ signal subscriptions are tied to the lifetime of the proxy object. When `onCancel` clears `signal_proxies_`, the proxies are destroyed and the corresponding signal subscriptions are automatically cancelled.
+
+<Callout variant="note">
+`plugin_common_sdbus::SystemDBus::Instance().GetConnection()` returns a shared D-Bus system connection managed by ivi-homescreen's `plugin_common` library. All plugins in the ivi-homescreen plugin suite share one connection to the system bus.
+</Callout>
+
+---
+
+## Thread Safety
+
+The `event_sink_` is accessed from two different threads:
+- The **D-Bus event loop thread** (where signals are delivered by sdbus-c++)
+- The **main/Flutter platform thread** (where `onListen`/`onCancel` run)
+
+Every access to `event_sink_` is protected by `sink_mutex_`. The signal callbacks use `std::lock_guard<std::mutex>` before calling `event_sink_->Success(...)`:
+
+```cpp
+std::lock_guard<std::mutex> lock(sink_mutex_);
+if (event_sink_) {
+  event_sink_->Success(flutter::EncodableValue(event));
+}
+```
+
+The null check `if (event_sink_)` is critical — D-Bus events can arrive briefly after the Dart subscription has been cancelled (between the moment the proxy is cleared and the D-Bus thread processes the cancellation).
+
+---
+
+## Summary
+
+In this part we covered:
+
+- The **C linkage entry point** required by ivi-homescreen
+- How the **MethodChannel** is created and how calls are dispatched to the right module
+- How the **EventChannel** is set up with `onListen`/`onCancel` lifecycle hooks
+- How D-Bus **signal subscriptions** are started on listen and torn down on cancel
+- The **thread safety** pattern for emitting events from the D-Bus thread
+
+In [Part 3](/blog/connman-agl-ivi-homescreen/pt3), we will go deeper into the two D-Bus operation modules: `ConnmanTechnology` (Wi-Fi radio control) and `ConnmanService` (network operations), and look at how blocking D-Bus calls are offloaded to background threads.
+
+---
+
+## References
+
+- [Flutter Plugin API (desktop)](https://api.flutter.dev/flutter/services/MethodChannel-class.html)
+- [ConnMan D-Bus API Documentation](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc)
+- [sdbus-c++ Signals](https://github.com/Kistler-Group/sdbus-cpp/blob/master/docs/using-sdbus-c++.md)
+- [flutter::EventChannel (desktop)](https://github.com/flutter/engine/blob/main/shell/platform/common/client_wrapper/include/flutter/event_channel.h)

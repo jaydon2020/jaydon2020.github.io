@@ -194,7 +194,7 @@ ConnMan remembers previously connected networks and reconnects automatically on 
 
 ## Configuring Wi-Fi via D-Bus
 
-ConnMan exposes its full API over D-Bus, which is how programmatic clients (like embedded UIs) communicate with it. You can also exercise this API directly from the shell using `gdbus` or `dbus-send`.
+ConnMan exposes its full API over D-Bus, which is how programmatic clients (like embedded UIs) communicate with it. You can also exercise this API directly from the shell using `busctl`.
 
 ### Key D-Bus Interfaces
 
@@ -207,48 +207,25 @@ ConnMan exposes its full API over D-Bus, which is how programmatic clients (like
 ### 1. Check the Manager State
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path / \
-  --method net.connman.Manager.GetProperties
+busctl call net.connman / net.connman.Manager GetProperties
 ```
 
 ### 2. Enable Wi-Fi Technology
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path /net/connman/technology/wifi \
-  --method net.connman.Technology.SetProperty \
-  "Powered" "<true>"
-```
-
-Or equivalently with `dbus-send`:
-
-```bash
-dbus-send --system --print-reply \
-  --dest=net.connman \
-  /net/connman/technology/wifi \
-  net.connman.Technology.SetProperty \
-  string:"Powered" variant:boolean:true
+busctl call net.connman /net/connman/technology/wifi net.connman.Technology SetProperty sv "Powered" b true
 ```
 
 ### 3. Trigger a Wi-Fi Scan
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path /net/connman/technology/wifi \
-  --method net.connman.Technology.Scan
+busctl call net.connman /net/connman/technology/wifi net.connman.Technology Scan
 ```
 
 ### 4. List Available Services
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path / \
-  --method net.connman.Manager.GetServices
+busctl call net.connman / net.connman.Manager GetServices
 ```
 
 This returns a list of `(object_path, dict)` pairs. Note the object path for the network you want (e.g., `/net/connman/service/wifi_aabbccddee_4d794e6574776f726b_managed_psk`).
@@ -258,10 +235,7 @@ This returns a list of `(object_path, dict)` pairs. Note the object path for the
 For open networks, connect directly:
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path /net/connman/service/wifi_aabbccddee_<id>_managed_none \
-  --method net.connman.Service.Connect
+busctl call net.connman /net/connman/service/wifi_aabbccddee_<id>_managed_none net.connman.Service Connect
 ```
 
 For WPA2 networks ConnMan requires an **agent** to supply the passphrase. The agent must be registered before calling `Connect`. The easiest approach for scripting is to pre-provision the credentials using a config file.
@@ -284,10 +258,7 @@ sudo systemctl restart connman
 After restart, ConnMan will auto-connect to the provisioned network. You can then confirm via D-Bus:
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path /net/connman/service/wifi_aabbccddee_4d794e6574776f726b_managed_psk \
-  --method net.connman.Service.GetProperties
+busctl call net.connman /net/connman/service/wifi_aabbccddee_4d794e6574776f726b_managed_psk net.connman.Service GetProperties
 ```
 
 Look for `"State"` → `"online"` in the output.
@@ -295,17 +266,14 @@ Look for `"State"` → `"online"` in the output.
 ### 7. Disconnect from a Service
 
 ```bash
-gdbus call --system \
-  --dest net.connman \
-  --object-path /net/connman/service/wifi_aabbccddee_<id>_managed_psk \
-  --method net.connman.Service.Disconnect
+busctl call net.connman /net/connman/service/wifi_aabbccddee_<id>_managed_psk net.connman.Service Disconnect
 ```
 
 <Callout variant="tip">
 You can monitor real-time D-Bus signals from ConnMan (e.g., service state changes) with:
 
 ```bash
-gdbus monitor --system --dest net.connman
+busctl monitor net.connman
 ```
 
 This is very useful when debugging connectivity issues or building reactive UI clients.

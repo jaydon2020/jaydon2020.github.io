@@ -1,0 +1,205 @@
+---
+title: "ConnMan on AGL ivi-homescreen, Part 1: Architecture Overview"
+description: "An introduction to building a Flutter plugin for ConnMan network management on AGL (Automotive Grade Linux) ivi-homescreen — covering the full stack from D-Bus to Dart."
+date: 2026-03-10
+tags: ["AGL", "Flutter", "ConnMan", "D-Bus", "ivi-homescreen", "C++", "Embedded Linux"]
+draft: false
+authors: ['jiande']
+order: 1
+---
+
+import Callout from '@/components/Callout.astro'
+
+If you have ever tried to add Wi-Fi management to a Flutter application running on **Automotive Grade Linux (AGL)**, you quickly discover there is no off-the-shelf plugin for it. The standard `connectivity_plus` or `wifi_iot` packages assume Android or iOS. On AGL, the system network daemon is **ConnMan** (Connection Manager), and it speaks **D-Bus**.
+
+This article series documents the design and implementation of a first-party Flutter embedder plugin — written in C++17 — that bridges the gap between a Flutter UI and ConnMan over the system D-Bus, running on an AGL IVI system powered by [ivi-homescreen](https://github.com/toyota-connected/ivi-homescreen).
+
+---
+
+## The Target Environment
+
+Before diving into code, it helps to understand what we are running on.
+
+| Layer | Technology |
+|---|---|
+| **OS** | AGL (Automotive Grade Linux) |
+| **Flutter Embedder** | [ivi-homescreen](https://github.com/toyota-connected/ivi-homescreen) |
+| **Plugin Language** | C++17 |
+| **IPC** | D-Bus (system bus) |
+| **D-Bus Library** | [sdbus-c++](https://github.com/Kistler-Group/sdbus-cpp) |
+| **Network Daemon** | ConnMan |
+| **Build System** | CMake |
+
+**AGL** is a Linux Foundation project that produces a Yocto-based Linux distribution for automotive IVI (In-Vehicle Infotainment) systems. It ships with ConnMan as the default network manager precisely because ConnMan is lightweight, embeddable, and well-suited to systems that do not have a full desktop environment.
+
+**ivi-homescreen** is a Flutter embedder targeting these embedded Linux environments. Unlike the standard `flutter-elinux` embedder, ivi-homescreen supports a plugin architecture where native C++ plugins register themselves with Flutter's plugin registrar — very similar to how platform channels work on Android and iOS.
+
+---
+
+## Why ConnMan?
+
+ConnMan is the standard network management daemon on AGL. Compared to NetworkManager, it is:
+
+- **Lightweight** — minimal RAM footprint, important for IVI systems.
+- **D-Bus native** — its entire API is exposed over D-Bus, making it straightforward to call from any language.
+- **Automotive-friendly** — supports ConnMan provisioning files for pre-configured networks, useful for fleet or factory deployments.
+
+The ConnMan D-Bus API is organized around three key interfaces:
+
+| D-Bus Interface | Object Path | Purpose |
+|---|---|---|
+| `net.connman.Manager` | `/` | Global manager: list technologies, list services, register agents |
+| `net.connman.Technology` | `/net/connman/technology/wifi` | Radio control: power on/off, scan |
+| `net.connman.Service` | `/net/connman/service/<id>` | Per-network operations: connect, disconnect, remove, status |
+
+There is also `net.connman.Agent`, which is a D-Bus object that *you* implement and register with ConnMan. ConnMan calls back into your agent when it needs credentials — the passphrase for a WPA2 network, for example.
+
+---
+
+## The Plugin Architecture
+
+The plugin lives in the `plugins/connman/` directory of the `ivi-homescreen-plugins` project and exposes two Flutter communication channels:
+
+```
+╔══════════════════════════════════════════════════════╗
+║               Flutter / Dart Layer                   ║
+║                                                      ║
+║  MethodChannel: "io.github.jaydon2020"               ║
+║  EventChannel:  "io.github.jaydon2020/events"        ║
+╚═══════════════╦══════════════════╦════════════════════╝
+                │ Method Calls     │ Event Stream
+                ▼                  ▼
+╔══════════════════════════════════════════════════════╗
+║              connman_plugin.cc                       ║
+║         (Registration + Dispatch + EventChannel)     ║
+║                                                      ║
+║  ╔────────────────╗  ╔──────────────────────────╗   ║
+║  ║ ConnmanAgent   ║  ║ connman_helpers.h        ║   ║
+║  ║ (D-Bus Agent)  ║  ║ (GetArgument, GetProp…)  ║   ║
+║  ╚────────────────╝  ╚──────────────────────────╝   ║
+║  ╔──────────────────╗ ╔────────────────────────╗    ║
+║  ║ConnmanTechnology ║ ║ ConnmanService         ║    ║
+║  ║(Tech operations) ║ ║ (Service operations)   ║    ║
+║  ╚──────────────────╝ ╚────────────────────────╝    ║
+╚═══════════════╦══════════════════════════════════════╝
+                │ sdbus-c++
+                ▼
+╔══════════════════════════════════════════════════════╗
+║           D-Bus System Bus                           ║
+║                                                      ║
+║  net.connman.Manager                                 ║
+║  net.connman.Technology (/net/connman/technology/*)  ║
+║  net.connman.Service    (/net/connman/service/*)     ║
+║  net.connman.Agent      (/net/connman/flutter_agent) ║
+╚══════════════════════════════════════════════════════╝
+```
+
+### File Structure
+
+```
+plugins/connman/
+├── CMakeLists.txt          # Build configuration
+├── connman_plugin.h        # C registration header (extern "C" entry point)
+├── connman_plugin.cc       # Plugin registration, MethodChannel dispatch, EventChannel
+├── connman_helpers.h       # Shared D-Bus property extraction utilities
+├── connman_agent.h         # ConnmanAgent class declaration
+├── connman_agent.cc        # net.connman.Agent implementation (credentials dialog)
+├── connman_technology.h    # Technology operations declaration
+├── connman_technology.cc   # Wi-Fi technology: powered/scan + PropertyChanged
+├── connman_service.h       # Service operations declaration
+└── connman_service.cc      # Wi-Fi services: list/connect/disconnect/remove + events
+```
+
+The design deliberately keeps `connman_plugin.cc` as a **thin dispatcher** — it owns the `MethodChannel`, `EventChannel`, and signal subscriptions, but delegates all D-Bus logic to the three dedicated modules.
+
+---
+
+## Supported MethodChannel API
+
+The plugin exposes the following methods over `MethodChannel("io.github.jaydon2020")`:
+
+| Method | Arguments | Returns | Description |
+|---|---|---|---|
+| `getWifiTechnology` | — | `Map` (powered, connected, type, name, path) | Get Wi-Fi technology status |
+| `setWifiPowered` | `{powered: bool}` | `bool` | Enable/disable Wi-Fi radio |
+| `scanWifi` | — | `bool` | Trigger Wi-Fi network scan |
+| `getWifiServices` | — | `List<Map>` (path, name, state, strength, security) | List available Wi-Fi networks |
+| `connectService` | `{path: String}` | `bool` | Connect to a network service |
+| `disconnectService` | `{path: String}` | `bool` | Disconnect from a network service |
+| `removeService` | `{path: String}` | `bool` | Remove (forget) a saved network |
+
+## Supported EventChannel API
+
+Live events are pushed through `EventChannel("io.github.jaydon2020/events")`:
+
+| Event type | Fields | Trigger |
+|---|---|---|
+| `servicesChanged` | `services: List<Map>` | Wi-Fi services added/removed/reordered |
+| `technologyPropertyChanged` | `path, name, value` | Technology property changed (e.g. Powered) |
+| `servicePropertyChanged` | `path, name, value` | Service property changed (e.g. State, Strength) |
+
+The key design decision here is **event-driven over polling**: rather than having the Dart layer periodically call `getWifiServices`, the C++ plugin subscribes to D-Bus signals and pushes updates through the EventChannel. This is both more efficient and more responsive.
+
+---
+
+## Dart Usage at a Glance
+
+On the Flutter/Dart side, the API is consumed like this:
+
+```dart
+const channel = MethodChannel('io.github.jaydon2020');
+const events  = EventChannel('io.github.jaydon2020/events');
+
+// Get Wi-Fi status
+final tech = await channel.invokeMethod('getWifiTechnology');
+print('Powered: ${tech['powered']}, Connected: ${tech['connected']}');
+
+// Turn on Wi-Fi and scan
+await channel.invokeMethod('setWifiPowered', {'powered': true});
+await channel.invokeMethod('scanWifi');
+
+// List networks
+final services = await channel.invokeListMethod('getWifiServices');
+for (final svc in services) {
+  print('${svc['name']} — ${svc['state']} (${svc['strength']}%)');
+}
+
+// Connect (ConnMan will call back to the agent for the passphrase)
+await channel.invokeMethod('connectService', {'path': services[0]['path']});
+
+// Live updates
+events.receiveBroadcastStream().listen((event) {
+  switch (event['type']) {
+    case 'servicesChanged':         // update network list
+    case 'servicePropertyChanged':  // update a single service
+    case 'technologyPropertyChanged': // update powered/connected
+  }
+});
+```
+
+<Callout variant="tip">
+The plugin also supports a **reverse method call** — `requestInput` — where C++ calls *into* Dart when ConnMan needs a password. This is covered in detail in Part 4.
+</Callout>
+
+---
+
+## Article Series Roadmap
+
+| Part | Topic |
+|---|---|
+| **Part 1** *(this article)* | AGL architecture overview, ConnMan D-Bus API, plugin design |
+| **Part 2** | Plugin registration, MethodChannel dispatch, EventChannel wiring in C++ |
+| **Part 3** | D-Bus operations: Technology and Service modules with sdbus-c++ |
+| **Part 4** | The ConnMan Agent: bridging D-Bus callbacks to Flutter dialogs |
+
+In [Part 2](/blog/connman-agl-ivi-homescreen/pt2), we will look at how the plugin registers itself with ivi-homescreen and how the MethodChannel and EventChannel are wired up in `connman_plugin.cc`.
+
+---
+
+## References
+
+- [ConnMan D-Bus API Documentation](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc)
+- [ivi-homescreen Flutter Embedder](https://github.com/toyota-connected/ivi-homescreen)
+- [sdbus-c++ Documentation](https://github.com/Kistler-Group/sdbus-cpp)
+- [AGL Project](https://www.automotivelinux.org/)
+- [connman-glib (AGL reference implementation)](https://github.com/AGL-ic-eg/connman-glib)

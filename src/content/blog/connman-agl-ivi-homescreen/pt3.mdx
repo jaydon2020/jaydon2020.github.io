@@ -1,0 +1,386 @@
+---
+title: "ConnMan on AGL ivi-homescreen, Part 3: D-Bus Operations with sdbus-c++"
+description: "How the ConnMan Flutter plugin uses sdbus-c++ to call net.connman.Technology and net.connman.Service D-Bus methods, handle blocking calls on background threads, and stream PropertyChanged signals to Flutter."
+date: 2026-03-12
+tags: ["AGL", "Flutter", "ConnMan", "D-Bus", "sdbus-c++", "ivi-homescreen", "C++", "Embedded Linux"]
+draft: false
+authors: ['jiande']
+order: 3
+---
+
+import Callout from '@/components/Callout.astro'
+
+In [Part 2](/blog/connman-agl-ivi-homescreen/pt2) we walked through the plugin's registration and how MethodChannel calls are dispatched and EventChannel subscriptions are managed. In this part we go deeper into the two D-Bus operation modules: `ConnmanTechnology` (Wi-Fi radio control) and `ConnmanService` (network operations), and explore the patterns used when working with sdbus-c++.
+
+---
+
+## sdbus-c++ Primer
+
+[sdbus-c++](https://github.com/Kistler-Group/sdbus-cpp) is a high-level C++ wrapper over libsystemd's D-Bus API. It provides:
+
+- **Proxy objects** (`sdbus::createProxy`) to call remote D-Bus methods.
+- **Object objects** (`sdbus::createObject`) to implement D-Bus interfaces (used in Part 4 for the Agent).
+- **Signal subscriptions** via `proxy->uponSignal(...).onInterface(...).call(lambda)`.
+- **Async method calls** via `callMethodAsync(...).getResultAsFuture<>().get()`.
+
+The key type in sdbus-c++ is `sdbus::Variant` — a type-erased container matching D-Bus's `variant` type. Checking what type it holds and extracting the value looks like this:
+
+```cpp
+sdbus::Variant v = /* ... */;
+if (v.containsValueOfType<std::string>()) {
+  std::string s = v.get<std::string>();
+} else if (v.containsValueOfType<bool>()) {
+  bool b = v.get<bool>();
+}
+```
+
+ConnMan uses `map<string, Variant>` for property dictionaries — a pattern that repeats throughout the codebase.
+
+---
+
+## The Helper Functions
+
+Before looking at the modules, the shared utilities in `connman_helpers.h` are worth examining because they appear everywhere:
+
+```cpp
+// Extract a string property from a ConnMan D-Bus property map.
+inline std::string GetStringProp(
+    const std::map<std::string, sdbus::Variant>& props,
+    const std::string& key) {
+  auto it = props.find(key);
+  if (it != props.end() && it->second.containsValueOfType<std::string>()) {
+    return it->second.get<std::string>();
+  }
+  return "";
+}
+
+inline bool GetBoolProp(const std::map<std::string, sdbus::Variant>& props,
+                        const std::string& key) { /* ... */ }
+
+inline uint8_t GetByteProp(const std::map<std::string, sdbus::Variant>& props,
+                            const std::string& key) { /* ... */ }
+
+// For Security — ConnMan returns a list; we take the first entry.
+inline std::string GetStringArrayFirst(
+    const std::map<std::string, sdbus::Variant>& props,
+    const std::string& key) {
+  auto it = props.find(key);
+  if (it != props.end() &&
+      it->second.containsValueOfType<std::vector<std::string>>()) {
+    auto vec = it->second.get<std::vector<std::string>>();
+    if (!vec.empty()) return vec.front();
+  }
+  return "";
+}
+```
+
+These helpers normalize the variant extraction and return safe defaults — essential for robustness on embedded systems where properties may be absent.
+
+---
+
+## ConnmanTechnology: Wi-Fi Radio Control
+
+### Discovering the Wi-Fi Technology Path
+
+ConnMan represents each network technology (Wi-Fi, Bluetooth, Ethernet) as a D-Bus object at a path like `/net/connman/technology/wifi`. Rather than hardcoding this path, the plugin discovers it dynamically by calling `net.connman.Manager.GetTechnologies`:
+
+```cpp
+std::string ConnmanTechnology::GetWifiTechnologyPath() {
+  try {
+    auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+    auto proxy = sdbus::createProxy(bus, sdbus::ServiceName("net.connman"),
+                                    sdbus::ObjectPath("/"));
+    std::vector<sdbus::Struct<sdbus::ObjectPath,
+                              std::map<std::string, sdbus::Variant>>> techs;
+    proxy->callMethod("GetTechnologies")
+        .onInterface("net.connman.Manager")
+        .storeResultsTo(techs);
+
+    for (const auto& tech : techs) {
+      if (GetStringProp(tech.get<1>(), "Type") == "wifi") {
+        return tech.get<0>().c_str();  // e.g. "/net/connman/technology/wifi"
+      }
+    }
+  } catch (const sdbus::Error& e) { /* ... */ }
+  return "";
+}
+```
+
+`GetTechnologies` returns a vector of `(ObjectPath, Properties)` structs. We iterate and look for `Type == "wifi"`. This is more robust than using a hardcoded path because the technology path might differ on some hardware.
+
+### GetWifiTechnology
+
+This method translates a ConnMan technology entry into a Dart `Map`:
+
+```cpp
+void ConnmanTechnology::GetWifiTechnology(
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  try {
+    // ... get techs via GetTechnologies ...
+    for (const auto& tech : techs) {
+      const auto& props = tech.get<1>();
+      if (GetStringProp(props, "Type") == "wifi") {
+        flutter::EncodableMap m;
+        m[flutter::EncodableValue("powered")] =
+            flutter::EncodableValue(GetBoolProp(props, "Powered"));
+        m[flutter::EncodableValue("connected")] =
+            flutter::EncodableValue(GetBoolProp(props, "Connected"));
+        m[flutter::EncodableValue("type")] =
+            flutter::EncodableValue(std::string("wifi"));
+        m[flutter::EncodableValue("name")] =
+            flutter::EncodableValue(GetStringProp(props, "Name"));
+        m[flutter::EncodableValue("path")] =
+            flutter::EncodableValue(tech.get<0>().c_str());
+        result->Success(flutter::EncodableValue(m));
+        return;
+      }
+    }
+    result->Success(flutter::EncodableValue());  // no wifi
+  } catch (const sdbus::Error& e) {
+    result->Error("DBUS_ERROR", e.getMessage());
+  }
+}
+```
+
+This runs synchronously on the platform thread — `GetTechnologies` is a fast, local query that doesn't block meaningfully.
+
+### SetWifiPowered and ScanWifi — Background Threading
+
+Powering the Wi-Fi radio on/off and triggering a scan can take time — ConnMan may wait for the driver to respond. Blocking the Flutter platform thread would freeze the UI. The solution is to offload to a background thread:
+
+```cpp
+void ConnmanTechnology::SetWifiPowered(
+    bool powered,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  std::string tech_path = GetWifiTechnologyPath();
+  if (tech_path.empty()) {
+    result->Error("NOT_FOUND", "WiFi technology not available");
+    return;
+  }
+
+  // Move result into a shared_ptr so the lambda can extend its lifetime.
+  auto shared = std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+      std::move(result));
+
+  std::thread([shared, powered, tech_path]() {
+    try {
+      auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+      auto proxy = sdbus::createProxy(bus, sdbus::ServiceName("net.connman"),
+                                      sdbus::ObjectPath(tech_path));
+      proxy->callMethodAsync("SetProperty")
+          .onInterface("net.connman.Technology")
+          .withArguments("Powered", sdbus::Variant(powered))
+          .getResultAsFuture<>()
+          .get();
+      shared->Success(flutter::EncodableValue(true));
+    } catch (const sdbus::Error& e) {
+      shared->Error("DBUS_ERROR", e.getMessage());
+    }
+  }).detach();
+}
+```
+
+The pattern is consistent for all blocking operations:
+
+1. **Wrap `result` in `shared_ptr`** — `unique_ptr` can't be captured by value in a lambda. A `shared_ptr` extends its lifetime to match the thread's.
+2. **Spawn a detached thread** — simple and sufficient for one-shot operations.
+3. **Call async, then `.get()`** — `callMethodAsync().getResultAsFuture<>().get()` issues the D-Bus call and blocks the background thread (not the platform thread) until ConnMan replies.
+4. **Call `Success` or `Error` on `shared`** — Flutter's MethodResult is thread-safe for this usage.
+
+<Callout variant="note">
+`ScanWifi` uses the identical pattern, calling `net.connman.Technology.Scan` instead of `SetProperty`. A Wi-Fi scan can take several seconds — the thread pattern is essential here.
+</Callout>
+
+### Subscribing to Technology PropertyChanged
+
+When the Wi-Fi radio is powered on or off — whether by our plugin or by external means — ConnMan emits a `PropertyChanged` signal. We subscribe to this in `SubscribeToPropertyChanged`:
+
+```cpp
+void ConnmanTechnology::SubscribeToPropertyChanged(
+    std::vector<std::unique_ptr<sdbus::IProxy>>& proxies,
+    std::mutex& sink_mutex,
+    std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>& event_sink) {
+  auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+  // Fetch all technologies to get their paths
+  auto mgr = sdbus::createProxy(bus, "net.connman", "/");
+  // ... get techList ...
+
+  for (const auto& tech : techList) {
+    auto tech_proxy = sdbus::createProxy(bus, "net.connman", tech.get<0>());
+    tech_proxy->uponSignal("PropertyChanged")
+        .onInterface("net.connman.Technology")
+        .call([&sink_mutex, &event_sink,
+               path = std::string(tech.get<0>().c_str())](
+                  const std::string& name, const sdbus::Variant& value) {
+          flutter::EncodableMap event;
+          event[flutter::EncodableValue("type")] =
+              flutter::EncodableValue(std::string("technologyPropertyChanged"));
+          event[flutter::EncodableValue("path")] =
+              flutter::EncodableValue(path);
+          event[flutter::EncodableValue("name")] =
+              flutter::EncodableValue(name);
+          // Marshal the variant value to a Dart-compatible type
+          if (value.containsValueOfType<std::string>()) {
+            event[flutter::EncodableValue("value")] =
+                flutter::EncodableValue(value.get<std::string>());
+          } else if (value.containsValueOfType<bool>()) {
+            event[flutter::EncodableValue("value")] =
+                flutter::EncodableValue(value.get<bool>());
+          }
+          std::lock_guard<std::mutex> lock(sink_mutex);
+          if (event_sink) {
+            event_sink->Success(flutter::EncodableValue(event));
+          }
+        });
+    proxies.push_back(std::move(tech_proxy));
+  }
+}
+```
+
+The `path` is captured by value in the lambda (via `path = std::string(...)`) because the original D-Bus object's lifetime is not guaranteed after the loop iteration ends.
+
+---
+
+## ConnmanService: Network Operations
+
+### GetWifiServices
+
+`GetWifiServices` fetches all services from `net.connman.Manager.GetServices` and filters to Wi-Fi only:
+
+```cpp
+void ConnmanService::GetWifiServices(
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  try {
+    auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+    auto proxy = sdbus::createProxy(bus, "net.connman", "/");
+    std::vector<sdbus::Struct<sdbus::ObjectPath,
+                              std::map<std::string, sdbus::Variant>>> services;
+    proxy->callMethod("GetServices")
+        .onInterface("net.connman.Manager")
+        .storeResultsTo(services);
+
+    flutter::EncodableList list;
+    for (const auto& srv : services) {
+      const auto& props = srv.get<1>();
+      if (GetStringProp(props, "Type") == "wifi") {
+        flutter::EncodableMap m;
+        m[flutter::EncodableValue("path")]     = srv.get<0>().c_str();
+        m[flutter::EncodableValue("name")]     = GetStringProp(props, "Name");
+        m[flutter::EncodableValue("state")]    = GetStringProp(props, "State");
+        m[flutter::EncodableValue("strength")] = GetByteProp(props, "Strength");
+        m[flutter::EncodableValue("security")] = GetStringArrayFirst(props, "Security");
+        list.push_back(flutter::EncodableValue(m));
+      }
+    }
+    result->Success(flutter::EncodableValue(list));
+  } catch (const sdbus::Error& e) {
+    result->Error("DBUS_ERROR", e.getMessage());
+  }
+}
+```
+
+ConnMan returns services in priority order — connected/favorite services appear first. The `Security` field is a `vector<string>` (e.g. `["psk"]`), so `GetStringArrayFirst` returns just the first entry.
+
+### Connect, Disconnect, Remove — Async Pattern
+
+All three service mutation operations follow the same background-thread pattern:
+
+```cpp
+void ConnmanService::ConnectService(
+    const std::string& path,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  auto shared = std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+      std::move(result));
+  std::thread([shared, path]() {
+    try {
+      auto& bus = plugin_common_sdbus::SystemDBus::Instance().GetConnection();
+      auto proxy = sdbus::createProxy(bus, "net.connman", sdbus::ObjectPath(path));
+      proxy->callMethodAsync("Connect")
+          .onInterface("net.connman.Service")
+          .getResultAsFuture<>()
+          .get();
+      shared->Success(flutter::EncodableValue(true));
+    } catch (const sdbus::Error& e) {
+      shared->Error("DBUS_ERROR", e.getMessage());
+    }
+  }).detach();
+}
+```
+
+`net.connman.Service.Connect` can block for many seconds — it performs the full association and DHCP negotiation. Without the background thread this would freeze the Flutter UI.
+
+<Callout variant="tip">
+When connecting to a WPA2 network, ConnMan will call back into our registered Agent (see Part 4) to request the passphrase. This happens on the D-Bus event loop thread, *also* blocking the `Connect` call until the passphrase is supplied.
+</Callout>
+
+### ServicesChanged — Pushing Fresh Snapshots
+
+ConnMan's `ServicesChanged` signal on `net.connman.Manager` fires when the service list changes — networks appear/disappear, or their order changes. Rather than forwarding the diff, the plugin re-fetches the full list and pushes it:
+
+```cpp
+void ConnmanService::PushServicesUpdate(
+    std::mutex& sink_mutex,
+    std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>& event_sink) {
+  try {
+    // ... fetch services same as GetWifiServices ...
+    flutter::EncodableMap event;
+    event[flutter::EncodableValue("type")] =
+        flutter::EncodableValue(std::string("servicesChanged"));
+    event[flutter::EncodableValue("services")] =
+        flutter::EncodableValue(list);
+
+    std::lock_guard<std::mutex> lock(sink_mutex);
+    if (event_sink) {
+      event_sink->Success(flutter::EncodableValue(event));
+    }
+  } catch (...) { /* ... */ }
+}
+```
+
+Re-fetching the full snapshot is simpler than applying diffs and avoids state synchronization bugs.
+
+### Service PropertyChanged
+
+Each known service also gets a `PropertyChanged` subscription, giving the Dart layer per-property updates:
+
+```cpp
+srv_proxy->uponSignal("PropertyChanged")
+    .onInterface("net.connman.Service")
+    .call([&sink_mutex, &event_sink, path = ...](
+              const std::string& name, const sdbus::Variant& value) {
+      flutter::EncodableMap event;
+      event["type"] = "servicePropertyChanged";
+      event["path"] = path;
+      event["name"] = name;
+      // Map variant types: string, bool, uint8 (Strength) → int
+      if (value.containsValueOfType<uint8_t>()) {
+        event["value"] = static_cast<int32_t>(value.get<uint8_t>());
+      } else if (...) { /* string, bool */ }
+      std::lock_guard<std::mutex> lock(sink_mutex);
+      if (event_sink) event_sink->Success(flutter::EncodableValue(event));
+    });
+```
+
+Note the `uint8_t` case for `Strength` — ConnMan reports signal strength as a byte (0–100%), but Flutter's `EncodableValue` doesn't have a `uint8_t` type, so it is widened to `int32_t`.
+
+---
+
+## Summary
+
+In this part we covered:
+
+- The **sdbus-c++ patterns** for calling D-Bus methods (`callMethod`, `callMethodAsync`), subscribing to signals (`uponSignal`), and extracting variants.
+- **`ConnmanTechnology`**: discovering the Wi-Fi path dynamically, reading technology properties, running `SetProperty(Powered)` and `Scan` on background threads.
+- **`ConnmanService`**: listing services (with `Type == "wifi"` filter), running `Connect`/`Disconnect`/`Remove` on background threads, pushing `servicesChanged` events as full snapshots, and subscribing to per-service `PropertyChanged` signals.
+- The **background thread pattern** (`shared_ptr<MethodResult>` + `std::thread`) for keeping the Flutter platform thread unblocked.
+
+In [Part 4](/blog/connman-agl-ivi-homescreen/pt4), we tackle the most interesting challenge: the **ConnMan Agent** — a D-Bus object we implement ourselves, which ConnMan calls back into when it needs credentials, and which bridges that call across to a Flutter dialog via `std::promise/future`.
+
+---
+
+## References
+
+- [ConnMan Manager API](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc/manager-api.txt)
+- [ConnMan Technology API](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc/technology-api.txt)
+- [ConnMan Service API](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc/service-api.txt)
+- [sdbus-c++ using guide](https://github.com/Kistler-Group/sdbus-cpp/blob/master/docs/using-sdbus-c++.md)
