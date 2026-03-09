@@ -1,8 +1,8 @@
 ---
 title: "How to Configure Wi-Fi on a Raspberry Pi 5 Running Minimal Yocto"
-description: "A step-by-step guide to troubleshooting and setting up Wi-Fi on a Raspberry Pi 5 that runs a minimal Yocto image using wpa_supplicant and systemd-networkd, without NetworkManager."
+description: "A step-by-step guide to troubleshooting and setting up Wi-Fi on a Raspberry Pi 5 that runs a minimal Yocto image using wpa_supplicant, systemd-networkd, and ConnMan (including D-Bus configuration), without NetworkManager."
 date: 2026-03-05
-tags: ["Raspberry Pi", "Yocto", "Networking", "Linux"]
+tags: ["Raspberry Pi", "Yocto", "Networking", "Linux", "ConnMan", "D-Bus"]
 draft: false
 authors: ['jiande']
 ---
@@ -129,7 +129,191 @@ To resolve this:
    sudo rfkill unblock wifi
    ```
 
-By manually defining the control interface for `wpa_supplicant` and tying IP configuration to `systemd-networkd`, you can successfully tame the Wi-Fi on a custom Yocto build for the Raspberry Pi 5. Happy tinkering!
+By manually defining the control interface for `wpa_supplicant` and tying IP configuration to `systemd-networkd`, you can successfully tame the Wi-Fi on a custom Yocto build for the Raspberry Pi 5.
+
+But there is another, often more integrated way to manage networking on embedded Linux: **ConnMan** (Connection Manager). Many AGL (Automotive Grade Linux) and Yocto-based images ship ConnMan as the primary network management daemon. Read on to see how to use it.
+
+---
+
+## Alternative: Using ConnMan
+
+[ConnMan](https://01.org/connman) is a lightweight network manager designed for embedded devices. If your Yocto image includes `connman` (check with `which connmanctl`), you can use it to connect to Wi-Fi without touching `wpa_supplicant` or `systemd-networkd` directly.
+
+### Enable and Start ConnMan
+
+```bash
+sudo systemctl enable connman
+sudo systemctl start connman
+```
+
+### Connect with `connmanctl`
+
+`connmanctl` provides an interactive shell for managing connections.
+
+```bash
+sudo connmanctl
+```
+
+Inside the interactive prompt:
+
+```text
+connmanctl> enable wifi
+connmanctl> scan wifi
+connmanctl> services
+```
+
+The `services` command lists available networks in the format:
+
+```text
+*AO MyNetwork  wifi_aabbccddee_4d794e6574776f726b_managed_psk
+```
+
+The long identifier (e.g., `wifi_aabbccddee_...`) is the **service path** you'll need next. Register an agent so ConnMan can ask for passwords, then connect:
+
+```text
+connmanctl> agent on
+connmanctl> connect wifi_aabbccddee_4d794e6574776f726b_managed_psk
+Agent RequestInput wifi_aabbccddee_...
+  Passphrase = [ Type=psk, Requirement=mandatory ]
+Passphrase? YourPassword
+connmanctl> quit
+```
+
+ConnMan handles DHCP automatically. Verify your connection:
+
+```bash
+ip addr show wlan0
+connmanctl services
+```
+
+<Callout variant="tip">
+ConnMan remembers previously connected networks and reconnects automatically on boot. No extra systemd units needed.
+</Callout>
+
+---
+
+## Configuring Wi-Fi via D-Bus
+
+ConnMan exposes its full API over D-Bus, which is how programmatic clients (like embedded UIs) communicate with it. You can also exercise this API directly from the shell using `gdbus` or `dbus-send`.
+
+### Key D-Bus Interfaces
+
+| Interface | Object Path | Purpose |
+|---|---|---|
+| `net.connman.Manager` | `/` | Global manager: enable technologies, list services |
+| `net.connman.Technology` | `/net/connman/technology/wifi` | Wi-Fi radio control |
+| `net.connman.Service` | `/net/connman/service/<id>` | Per-network: connect, disconnect, properties |
+
+### 1. Check the Manager State
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path / \
+  --method net.connman.Manager.GetProperties
+```
+
+### 2. Enable Wi-Fi Technology
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path /net/connman/technology/wifi \
+  --method net.connman.Technology.SetProperty \
+  "Powered" "<true>"
+```
+
+Or equivalently with `dbus-send`:
+
+```bash
+dbus-send --system --print-reply \
+  --dest=net.connman \
+  /net/connman/technology/wifi \
+  net.connman.Technology.SetProperty \
+  string:"Powered" variant:boolean:true
+```
+
+### 3. Trigger a Wi-Fi Scan
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path /net/connman/technology/wifi \
+  --method net.connman.Technology.Scan
+```
+
+### 4. List Available Services
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path / \
+  --method net.connman.Manager.GetServices
+```
+
+This returns a list of `(object_path, dict)` pairs. Note the object path for the network you want (e.g., `/net/connman/service/wifi_aabbccddee_4d794e6574776f726b_managed_psk`).
+
+### 5. Connect to a Service
+
+For open networks, connect directly:
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path /net/connman/service/wifi_aabbccddee_<id>_managed_none \
+  --method net.connman.Service.Connect
+```
+
+For WPA2 networks ConnMan requires an **agent** to supply the passphrase. The agent must be registered before calling `Connect`. The easiest approach for scripting is to pre-provision the credentials using a config file.
+
+### 6. Pre-provision Wi-Fi Credentials (for WPA2)
+
+Create a provisioning file in `/var/lib/connman/` (ConnMan reads these on startup):
+
+```bash
+sudo tee /var/lib/connman/my-network.config > /dev/null <<EOF
+[service_wifi_aabbccddee_4d794e6574776f726b_managed_psk]
+Type=wifi
+Name=MyNetwork
+Passphrase=YourPassword
+EOF
+
+sudo systemctl restart connman
+```
+
+After restart, ConnMan will auto-connect to the provisioned network. You can then confirm via D-Bus:
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path /net/connman/service/wifi_aabbccddee_4d794e6574776f726b_managed_psk \
+  --method net.connman.Service.GetProperties
+```
+
+Look for `"State"` → `"online"` in the output.
+
+### 7. Disconnect from a Service
+
+```bash
+gdbus call --system \
+  --dest net.connman \
+  --object-path /net/connman/service/wifi_aabbccddee_<id>_managed_psk \
+  --method net.connman.Service.Disconnect
+```
+
+<Callout variant="tip">
+You can monitor real-time D-Bus signals from ConnMan (e.g., service state changes) with:
+
+```bash
+gdbus monitor --system --dest net.connman
+```
+
+This is very useful when debugging connectivity issues or building reactive UI clients.
+</Callout>
+
+---
+
+Happy tinkering!
 
 ## References
 
@@ -137,3 +321,5 @@ By manually defining the control interface for `wpa_supplicant` and tying IP con
 - [Arch Wiki: systemd-networkd](https://wiki.archlinux.org/title/Systemd-networkd)
 - [Arch Wiki: wpa_supplicant](https://wiki.archlinux.org/title/Wpa_supplicant)
 - [Arch Wiki: ConnMan](https://wiki.archlinux.org/title/ConnMan)
+- [ConnMan D-Bus API Reference](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc)
+- [ConnMan service provisioning files](https://git.kernel.org/pub/scm/network/connman/connman.git/tree/doc/config-format.txt)
