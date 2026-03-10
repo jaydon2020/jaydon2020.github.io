@@ -172,6 +172,8 @@ void ConnmanTechnology::SetWifiPowered(
           .withArguments("Powered", sdbus::Variant(powered))
           .getResultAsFuture<>()
           .get();
+      // NOTE: Calling Success from this background thread is unsafe
+      // and will be fixed in Part 5.
       shared->Success(flutter::EncodableValue(true));
     } catch (const sdbus::Error& e) {
       shared->Error("DBUS_ERROR", e.getMessage());
@@ -185,7 +187,7 @@ The pattern is consistent for all blocking operations:
 1. **Wrap `result` in `shared_ptr`** — `unique_ptr` can't be captured by value in a lambda. A `shared_ptr` extends its lifetime to match the thread's.
 2. **Spawn a detached thread** — simple and sufficient for one-shot operations.
 3. **Call async, then `.get()`** — `callMethodAsync().getResultAsFuture<>().get()` issues the D-Bus call and blocks the background thread (not the platform thread) until ConnMan replies.
-4. **Call `Success` or `Error` on `shared`** — Flutter's MethodResult is thread-safe for this usage.
+4. **Call `Success` or `Error` on `shared`**. As discussed in Part 5, calling this directly from the background thread is unsafe and must be marshalled back to the platform thread.
 
 <Callout variant="note">
 `ScanWifi` uses the identical pattern, calling `net.connman.Technology.Scan` instead of `SetProperty`. A Wi-Fi scan can take several seconds — the thread pattern is essential here.
@@ -299,6 +301,8 @@ void ConnmanService::ConnectService(
           .onInterface("net.connman.Service")
           .getResultAsFuture<>()
           .get();
+      // NOTE: Calling Success from this background thread is unsafe
+      // and will be fixed in Part 5.
       shared->Success(flutter::EncodableValue(true));
     } catch (const sdbus::Error& e) {
       shared->Error("DBUS_ERROR", e.getMessage());
