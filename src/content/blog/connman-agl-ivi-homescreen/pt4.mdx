@@ -300,8 +300,11 @@ void _onEvent(dynamic raw) {
 | **Part 2** | [Plugin registration, MethodChannel dispatch, EventChannel wiring in C++](/blog/connman-agl-ivi-homescreen/pt2) |
 | **Part 3** | [D-Bus operations: Technology and Service modules with sdbus-c++](/blog/connman-agl-ivi-homescreen/pt3) |
 | **Part 4** *(this article)* | The ConnMan Agent: bridging D-Bus callbacks to Flutter dialogs |
+| **Part 5** | [Fixing Thread-Safety Issues with Flutter APIs](/blog/connman-agl-ivi-homescreen/pt5) |
 
-Across this four-part series we've covered the complete implementation of a ConnMan Flutter plugin for AGL ivi-homescreen:
+In [Part 5](/blog/connman-agl-ivi-homescreen/pt5), we conclude the series by addressing critical thread-safety issues, ensuring that the plugin is not just functional but completely crash-free by properly marshalling Flutter API calls back to the platform thread.
+
+Across this five-part series we've covered the complete implementation of a ConnMan Flutter plugin for AGL ivi-homescreen:
 
 1. **Thin dispatcher** — `connman_plugin.cc` owns channels and routing; D-Bus logic is encapsulated in dedicated modules.
 2. **Background threads** — blocking D-Bus calls (`Connect`, `Scan`, `SetProperty`) run on detached threads to keep the Flutter platform thread responsive.

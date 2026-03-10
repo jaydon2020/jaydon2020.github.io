@@ -284,6 +284,8 @@ Every access to `event_sink_` is protected by `sink_mutex_`. The signal callback
 ```cpp
 std::lock_guard<std::mutex> lock(sink_mutex_);
 if (event_sink_) {
+  // NOTE: Calling Success from the D-Bus thread here is actually unsafe
+  // and will be fixed in Part 5 using g_idle_add.
   event_sink_->Success(flutter::EncodableValue(event));
 }
 ```

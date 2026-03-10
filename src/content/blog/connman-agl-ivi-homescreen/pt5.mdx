@@ -1,0 +1,132 @@
+---
+title: "ConnMan on AGL ivi-homescreen, Part 5: Fixing Thread-Safety Issues with Flutter APIs"
+description: "Addressing critical thread-safety issues in the ConnMan plugin by marshalling background D-Bus callbacks and detached threads back to the Flutter platform thread."
+date: 2026-03-20
+tags: ["AGL", "Flutter", "ConnMan", "D-Bus", "ivi-homescreen", "C++", "Embedded Linux"]
+draft: false
+authors: ['jiande']
+order: 5
+---
+
+import Callout from '@/components/Callout.astro'
+
+In our previous parts, we built a well-structured ConnMan plugin for AGL ivi-homescreen that bridges sdbus-c++ calls to the Dart side. However, the initial implementation contains several critical thread-safety issues in how it interacts with the Flutter Engine APIs.
+
+The primary issue is that Flutter's engine APIs—specifically `flutter::MethodChannel::InvokeMethod`, `flutter::MethodResult::Success/Error`, and `flutter::EventSink::Success/Error`—are **not thread-safe**. They must be called strictly on the main platform thread. Calling them from a background thread results in undefined behavior and can often cause crashes.
+
+In this part, we will identify where these unsafe calls occur and how to fix them by marshalling tasks back to the Flutter platform thread.
+
+---
+
+## Identifying the Thread-Safety Issues
+
+Here are the specific locations in the plugin where thread-safety rules are violated:
+
+### 1. `ConnmanAgent::RequestInput` (`connman_agent.cc`)
+When `sdbus-c++` receives the D-Bus method call `RequestInput`, it invokes the callback on the D-Bus event loop thread (spawned by `SystemDBus::Instance()`). In this callback, the code does:
+
+```cpp
+channel_->InvokeMethod("requestInput", ...);
+```
+
+Calling `InvokeMethod` from the D-Bus event loop thread is unsafe. We must route this request back to the Flutter platform thread. Furthermore, because ConnMan expects a synchronous-like return via a D-Bus reply, the `promise/future` design blocking the background D-Bus thread is conceptually problematic if it blocks the main D-Bus event loop thread, preventing other D-Bus events from processing and potentially causing timeouts or deadlocks.
+
+### 2. Async Methods in `ConnmanService` (`connman_service.cc`)
+In `ConnectService`, `DisconnectService`, and `RemoveService`, we are creating detached threads:
+
+```cpp
+std::thread([shared, path]() {
+    // ... D-Bus operations ...
+    shared->Success(...);
+}).detach();
+```
+
+Invoking `shared->Success(...)` and `shared->Error(...)` from inside this detached background thread violates Flutter's threading rules.
+
+### 3. Async Methods in `ConnmanTechnology` (`connman_technology.cc`)
+Similarly, `SetWifiPowered` and `ScanWifi` spawn a `std::thread` and invoke `shared->Success(...)` and `shared->Error(...)` from the detached thread.
+
+### 4. EventChannel Push Callbacks
+When `SubscribeToPropertyChanged` and `PushServicesUpdate` are triggered via D-Bus signal callbacks (`uponSignal`), they run on the D-Bus event loop thread. Calling `event_sink_->Success(...)` from these callbacks is unsafe and will crash the application under load.
+
+---
+
+## Fixing the Threading Issues
+
+To fix these issues, we must marshal all Flutter API callbacks back to the main platform thread before invoking them.
+
+Since the Linux Embedder (which ivi-homescreen uses) relies on GTK/GLib, we can use `g_idle_add` or `g_main_context_invoke` to post tasks back to the GTK main loop, which serves as the Flutter platform thread.
+
+### Safely Calling `MethodResult` on the Main Thread
+
+Here is an example of how to safely call `MethodResult::Success` from a background thread using `glib`:
+
+```cpp
+#include <glib.h>
+#include <memory>
+#include <flutter/method_result.h>
+
+struct SuccessTask {
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
+    bool value;
+};
+
+gboolean OnSuccessIdle(gpointer user_data) {
+    auto task = static_cast<SuccessTask*>(user_data);
+    task->result->Success(flutter::EncodableValue(task->value));
+    delete task;
+    return G_SOURCE_REMOVE;
+}
+
+// Inside your std::thread:
+auto task = new SuccessTask{shared, true};
+g_idle_add(OnSuccessIdle, task);
+```
+
+By wrapping our `Success` and `Error` calls in idle tasks, GLib ensures they execute on the main thread, keeping Flutter happy.
+
+### Fixing `RequestInput` Blocking
+
+For the `RequestInput` blocking issue, the best approach is to implement the `ConnmanAgent` using **asynchronous D-Bus method responses**. `sdbus-c++` supports async method returns by passing a `sdbus::Result` object into the method handler.
+
+Instead of blocking the D-Bus thread with a `promise` and `future`, you:
+1. Grab the `sdbus::Result` object.
+2. Post a task to the platform thread (using `g_idle_add`) to call `InvokeMethod`.
+3. When Dart replies (via the `MethodResultFunctions` callbacks), post a task back or directly resolve the `sdbus::Result` to send the D-Bus reply.
+
+This ensures no threads are blocked while waiting for the user to type their Wi-Fi password in the Flutter UI.
+
+---
+
+## Conclusion
+
+When building Flutter plugins with background tasks—especially those communicating over IPC mechanisms like D-Bus—always remember that **Flutter Engine APIs must be called on the platform thread**. Using standard Linux UI loop primitives like GLib's `g_idle_add` makes thread-hopping straightforward and ensures your plugin remains crash-free.
+
+With these fixes implemented, our ConnMan plugin is not just functional, but robust and thread-safe!
+
+---
+
+## Article Series Roadmap
+
+| Part | Topic |
+|---|---|
+| **Part 1** | [AGL architecture overview, ConnMan D-Bus API, plugin design](/blog/connman-agl-ivi-homescreen) |
+| **Part 2** | [Plugin registration, MethodChannel dispatch, EventChannel wiring in C++](/blog/connman-agl-ivi-homescreen/pt2) |
+| **Part 3** | [D-Bus operations: Technology and Service modules with sdbus-c++](/blog/connman-agl-ivi-homescreen/pt3) |
+| **Part 4** | [The ConnMan Agent: bridging D-Bus callbacks to Flutter dialogs](/blog/connman-agl-ivi-homescreen/pt4) |
+| **Part 5** *(this article)* | Fixing Thread-Safety Issues with Flutter APIs |
+
+Across this five-part series we've covered the complete implementation of a ConnMan Flutter plugin for AGL ivi-homescreen:
+
+1. **Thin dispatcher** — `connman_plugin.cc` owns channels and routing; D-Bus logic is encapsulated in dedicated modules.
+2. **Background threads** — blocking D-Bus calls (`Connect`, `Scan`, `SetProperty`) run on detached threads to keep the Flutter platform thread responsive.
+3. **Event-driven** — D-Bus `PropertyChanged` and `ServicesChanged` signals drive UI updates; no polling needed.
+4. **Promise/future bridge** — enables synchronous D-Bus callbacks to cross thread boundaries safely to a Flutter dialog.
+5. **Thread Safety** — ensures Flutter APIs are called strictly on the platform thread via `g_idle_add`.
+
+---
+
+## References
+
+- [GLib Main Event Loop](https://docs.gtk.org/glib/main-loop.html)
+- [Flutter Engine C++ API](https://github.com/flutter/engine)
