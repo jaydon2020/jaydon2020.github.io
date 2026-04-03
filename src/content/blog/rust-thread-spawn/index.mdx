@@ -1,0 +1,490 @@
+---
+title: "Learning Rust Threads: From Confusion to Clarity"
+description: "A beginner's journey through Rust's threading model — covering spawn, move closures, scoped threads, thread-local storage, and panic handling."
+date: 2026-04-03
+tags: ["Rust", "Threads", "Concurrency", "Beginner"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+## Introduction
+
+I came to Rust from Python and JavaScript, where threading is either confusing or avoided entirely. When I first opened the standard library docs for `std::thread`, I expected the same pain — but something different happened. The Rust compiler didn't just let me write broken code; it actively taught me why my threading attempts were wrong, and nudged me toward correct solutions.
+
+This post is my learning journey through Rust threads. It's written from a beginner's perspective, documenting the confusion points, the "aha" moments, and the patterns that finally made everything click. If you're struggling to understand `move` closures, why scoped threads exist, or how `Send` and `Sync` actually matter, this is for you.
+
+---
+
+## Why Threads? And Why Is Rust Different?
+
+The core motivation for threading is simple: do two things at once. Compute something while fetching data. Process a request while handling the next one. The hard part isn't *wanting* concurrency — it's *doing it safely*.
+
+In many languages, threading leaves you vulnerable. A data race can silently corrupt memory. A missed lock can cause a deadlock. You're responsible for every synchronization detail, and the compiler won't catch your mistakes until they're bugs in production.
+
+Rust takes a different approach. Instead of trusting you to get threading right, it enforces thread safety at compile time through the ownership model and two special traits: `Send` and `Sync`. Before you even run a single thread, the compiler verifies that your code is safe. This feels alien at first — the error messages are cryptic, the borrow checker is strict — but once you understand the rules, you gain confidence that your concurrent code actually works.
+
+<Callout variant="note">
+This post uses `std::thread` only, covering OS threads created by the standard library. Async runtimes like Tokio handle concurrency differently and are outside the scope here.
+</Callout>
+
+---
+
+## 1. Your First Thread: `spawn` and `move`
+
+Let's start with the simplest possible thread. Here's the function signature:
+
+```rust
+pub fn spawn<F>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+```
+
+That's a lot to unpack, but the core idea is simple: pass a closure to `spawn`, and it runs in a new OS thread.
+
+```rust
+use std::thread;
+
+thread::spawn(|| {
+    println!("Hello from a thread!");
+});
+```
+
+That works. But what if you want to use a variable from the outer scope?
+
+```rust
+let name = "Alice";
+thread::spawn(|| {
+    println!("Hello, {}!", name);  // error: `name` may not live long enough
+});
+```
+
+The compiler rejects this. Why? The spawned thread might outlive the current scope. If `name` is on the stack and the scope exits before the thread finishes, the thread would be reading freed memory — a use-after-free bug.
+
+### The `move` Keyword — My First Stumbling Block
+
+The fix is the `move` keyword, which *transfers* ownership of `name` into the closure:
+
+```rust
+let name = "Alice";
+thread::spawn(move || {
+    println!("Hello, {}!", name);  // works! name is owned by the closure
+});
+```
+
+Now `name` lives as long as the closure — which is `'static` (lives forever, or at least until the program exits).
+
+<Callout variant="warning">
+Here's where I got stuck: after a `move` closure, you **can no longer use that variable in the outer scope**. This code fails:
+
+```rust
+let name = "Alice";
+thread::spawn(move || {
+    println!("Hello, {}!", name);
+});
+println!("Name is: {}", name);  // error: `name` was moved
+```
+
+The move is real. The ownership is transferred. Once you move `name` into the thread, it's gone from the outer scope. If you need the variable later, you must think about whether you can pass a copy (for `Copy` types like numbers) or must restructure your code.
+</Callout>
+
+### Waiting for the Thread: `JoinHandle::join()`
+
+Spawning a thread is one thing. Getting the result is another. When you call `spawn`, you get a `JoinHandle<T>`, which represents a "handle" to the spawned thread. The `.join()` method blocks until the thread finishes and returns its result:
+
+```rust
+let numbers = vec![1, 2, 3, 4];
+let handle = thread::spawn(move || {
+    numbers.into_iter().map(|x| x * 2).collect::<Vec<i32>>()
+});
+
+let result = handle.join().unwrap();
+println!("Doubled: {:?}", result);  // Doubled: [2, 4, 6, 8]
+```
+
+Here's the flow:
+1. `thread::spawn` returns immediately with a `JoinHandle`.
+2. The thread runs in the background.
+3. `.join()` blocks the current thread until the spawned thread finishes.
+4. `.unwrap()` extracts the return value (or panics if the thread panicked).
+
+<Callout variant="tip">
+Think of `JoinHandle` like a receipt. You hand off work, get a receipt, and later "cash it in" with `.join()` to get your result. Forgetting to call `.join()` means the thread may be abandoned before it finishes — the OS will clean it up, but you'll never get the result.
+</Callout>
+
+---
+
+## 2. Parallel Work: Splitting a Problem Across Threads
+
+The "aha" moment: threads are only useful when they *do work in parallel*. Let's compute the sum of two vectors simultaneously:
+
+```rust
+let a = vec![1, 2, 3];
+let b = vec![4, 5, 6];
+
+let handle_a = thread::spawn(move || a.into_iter().sum::<i32>());
+let handle_b = thread::spawn(move || b.into_iter().sum::<i32>());
+
+let (sum_a, sum_b) = (handle_a.join().unwrap(), handle_b.join().unwrap());
+println!("Sums: {} + {} = {}", sum_a, sum_b, sum_a + sum_b);
+```
+
+The key insight: both threads run *between* the spawn calls and the join calls. If you spawn and immediately join in a loop, you get no parallelism:
+
+```rust
+// BAD: No parallelism
+for vec in vecs {
+    let handle = thread::spawn(move || vec.iter().sum::<i32>());
+    let sum = handle.join().unwrap();  // waits for this thread before spawning the next
+}
+
+// GOOD: Parallelism
+let handles: Vec<_> = vecs.into_iter()
+    .map(|vec| thread::spawn(move || vec.iter().sum::<i32>()))
+    .collect();
+let sums: Vec<i32> = handles.into_iter()
+    .map(|h| h.join().unwrap())
+    .collect();
+```
+
+In the second version, all threads run in parallel before you collect results.
+
+<Callout variant="intuition">
+The pattern is: **spawn all work first, then join all results**. Interleaving spawn and join serializes the work, defeating the purpose of threading.
+</Callout>
+
+---
+
+## 3. Named Threads with `thread::Builder`
+
+So far we've used `thread::spawn`, which is convenient but limited. For more control, use `thread::Builder`:
+
+```rust
+use std::thread;
+
+let handle = thread::Builder::new()
+    .name("worker".into())
+    .spawn(|| {
+        println!("Hello from a named thread!");
+        42
+    })
+    .unwrap();
+
+let result = handle.join().unwrap();
+```
+
+### Why Name a Thread?
+
+When a thread panics, the error message includes the thread's name. Compare:
+
+```
+thread 'unnamed' panicked at 'something went wrong'
+```
+
+versus:
+
+```
+thread 'worker-1' panicked at 'something went wrong'
+```
+
+The second is vastly more useful. In a program with dozens of threads, a name is your first debugging hint.
+
+### Adding a Sleep
+
+Let's combine named threads with `thread::sleep` to simulate work:
+
+```rust
+use std::time::Duration;
+
+let handle = thread::Builder::new()
+    .name("sleeper".into())
+    .spawn(|| {
+        println!("Thread starting...");
+        thread::sleep(Duration::from_millis(100));
+        println!("Thread done!");
+        42
+    })
+    .unwrap();
+
+println!("Waiting...");
+let result = handle.join().unwrap();
+println!("Got result: {}", result);
+```
+
+`thread::sleep(Duration)` pauses *only the current thread*. Other threads continue running. This is the opposite of a global sleep.
+
+<Callout variant="warning">
+`Builder::spawn` returns `Result<JoinHandle, io::Error>`, not `JoinHandle` directly. It can fail if the OS can't allocate a new thread. Don't skip the `.unwrap()` — handle the error properly in production:
+
+```rust
+let handle = thread::Builder::new()
+    .name("worker".into())
+    .spawn(|| { /* ... */ })
+    .map_err(|e| eprintln!("Failed to spawn thread: {}", e))?;
+```
+</Callout>
+
+---
+
+## 4. Thread-Local Storage: `thread_local!` and `RefCell`
+
+Now things get interesting. What if you want each thread to have its own independent copy of some state, with zero synchronization overhead?
+
+### What Does "Thread-Local" Even Mean?
+
+Imagine each thread has its own private notebook. A variable declared as `thread_local!` exists in every thread, but each thread sees only its own copy. There's no sharing, no locks, no contention.
+
+### Using `thread_local!` and `RefCell`
+
+Here's a concrete example:
+
+```rust
+use std::cell::RefCell;
+use std::thread;
+
+thread_local! {
+    static THREAD_COUNT: RefCell<usize> = RefCell::new(0);
+}
+
+fn increment() -> usize {
+    THREAD_COUNT.with(|cell| {
+        *cell.borrow_mut() += 1;
+        *cell.borrow()
+    })
+}
+
+fn main() {
+    // Main thread
+    println!("Main: {}", increment());  // Main: 1
+    println!("Main: {}", increment());  // Main: 2
+
+    // Spawned thread
+    let handle = thread::spawn(|| {
+        println!("Worker: {}", increment());  // Worker: 1 (independent counter)
+        println!("Worker: {}", increment());  // Worker: 2
+    });
+
+    handle.join().unwrap();
+
+    // Main thread counter is unaffected
+    println!("Main: {}", increment());  // Main: 3
+}
+```
+
+Each thread has its own `THREAD_COUNT`. The worker thread's counter starts at 0, independent of the main thread's counter.
+
+<Callout variant="note">
+The `.with()` method is how you access thread-local values. You can't just dereference `THREAD_COUNT` like a normal variable — you must go through `.with()` and pass a closure. This is because the static variable lives in each thread independently, and `.with()` finds and accesses the copy in the current thread.
+</Callout>
+
+Why use `RefCell` inside a `thread_local!`? Because `RefCell` allows interior mutability — you can mutate through a shared reference. It's safe here because each thread has its own `RefCell`, so there's no actual sharing. `RefCell` is not `Sync` (not safe to share across threads), but `thread_local!` bypasses that constraint by guaranteeing no sharing in the first place.
+
+<Callout variant="tip">
+Thread-locals are great for:
+- Per-thread caches (avoid synchronization overhead)
+- Counters or statistics unique to each thread
+- Random number generator state (most RNGs are not `Sync`)
+- Database connections or other expensive, non-`Sync` resources
+
+They're not great for sharing data — use `Arc` and `Mutex` for that.
+</Callout>
+
+---
+
+## 5. Scoped Threads: Borrowing Without `move` (Rust 1.63+)
+
+So far, every thread has required `move` closures. That's been bothering me. What if I just want to read some data from the parent without transferring ownership? What if I have two slices from the same vector and want to sum them in parallel?
+
+The old answer was "you can't without cloning" — until Rust 1.63 introduced scoped threads.
+
+### Why Scoped Threads Exist
+
+The problem: you have two slices that you want to process in parallel:
+
+```rust
+let a = vec![1, 2, 3];
+let b = vec![4, 5, 6];
+
+// This doesn't compile:
+let handle_a = thread::spawn(|| a.iter().sum::<i32>());
+let handle_b = thread::spawn(|| b.iter().sum::<i32>());
+// error: `a` may not live long enough (same for `b`)
+```
+
+You can't move both `a` and `b` (each is moved twice). You can't borrow them (the compiler can't prove the threads finish before the current scope exits).
+
+The solution: `thread::scope` creates a scope where spawned threads are **guaranteed** to finish before the scope ends. This lets the borrow checker reason about lifetimes correctly.
+
+### The `thread::scope` API
+
+```rust
+use std::thread;
+
+let a = vec![1, 2, 3];
+let b = vec![4, 5, 6];
+
+let (sum_a, sum_b) = thread::scope(|s| {
+    let h1 = s.spawn(|| a.iter().sum::<i32>());  // borrows a, no move
+    let h2 = s.spawn(|| b.iter().sum::<i32>());  // borrows b, no move
+    (h1.join().unwrap(), h2.join().unwrap())
+});
+
+// a and b are still accessible here!
+println!("Sums: {} + {}", sum_a, sum_b);
+```
+
+The closure passed to `scope` receives a `Scope` object (`s`). Instead of calling `thread::spawn`, you call `s.spawn`, which returns a scoped `JoinHandle`. These handles are guaranteed to finish before the scope ends, so the borrow checker allows borrowing `a` and `b`.
+
+<Callout variant="tip">
+**Prefer scoped threads whenever you're working with data that already exists in the parent.** They eliminate unnecessary clones and communicate intent: "these threads are helpers for this block of work, not independent tasks."
+
+If you're spawning a thread to do something independent and you want to join it later (or never), use `thread::spawn`. If you're parallelizing a portion of your current function, use `thread::scope`.
+</Callout>
+
+---
+
+## 6. Panic Handling: When a Thread Goes Wrong
+
+What happens if a spawned thread panics? The answer might surprise you: the parent thread does *not* automatically panic.
+
+### `join()` Returns a `Result`
+
+The return type of `handle.join()` is `Result<T, Box<dyn Any + Send>>`. When a thread completes successfully, `join()` returns `Ok(T)`. When a thread panics, `join()` returns `Err` with the panic payload.
+
+```rust
+use std::thread;
+
+let handle = thread::spawn(|| {
+    panic!("something went wrong");
+});
+
+match handle.join() {
+    Ok(_) => println!("Thread succeeded"),
+    Err(_) => println!("Thread panicked!"),
+}
+```
+
+The parent thread prints "Thread panicked!" and continues. The panic is isolated.
+
+### Matching on Thread Panics
+
+Often you only care whether the thread succeeded, not the panic payload. Use `map_err(|_| ())`:
+
+```rust
+let result: Result<i32, ()> = thread::spawn(|| {
+    if some_condition {
+        panic!("oops");
+    } else {
+        42
+    }
+}).join().map_err(|_| ());
+
+match result {
+    Ok(val) => println!("Result: {}", val),
+    Err(()) => println!("Thread panicked"),
+}
+```
+
+<Callout variant="danger">
+Here's the silent failure mode: **by default, a thread panic is isolated — the parent thread does not automatically panic.** This means a worker thread can fail silently if you never call `.join()` and never check the result.
+
+```rust
+thread::spawn(|| {
+    panic!("critical error!");
+});
+// If this thread panics, the main thread continues obliviously.
+// The panic is lost.
+```
+
+Always call `.join()` on your threads, or at minimum check and log `Err` results. A common pattern is to collect all handles and join them at the end:
+
+```rust
+let handles: Vec<_> = (0..10)
+    .map(|i| thread::spawn(move || { /* work */ }))
+    .collect();
+
+for handle in handles {
+    if let Err(e) = handle.join() {
+        eprintln!("Worker panicked: {:?}", e);
+    }
+}
+```
+</Callout>
+
+---
+
+## 7. Understanding `Send` and `Sync`
+
+We've seen these traits mentioned in error messages. Now let's understand what they actually mean.
+
+- **`Send`**: A type is `Send` if it's safe to transfer ownership to another thread. Most types are `Send`. Exceptions: `Rc<T>` (non-atomic reference counting), raw pointers.
+- **`Sync`**: A type is `Sync` if it's safe to share a reference (`&T`) between threads. Most types are `Sync`. Exceptions: `RefCell<T>`, `Cell<T>`, `Mutex<T>` (wait, that's actually `Sync` in Rust! but the contents might not be).
+
+Here's a mental model table:
+
+| Type | Send | Sync | Notes |
+|---|---|---|---|
+| `i32`, `String`, `Vec<T>` | ✓ | ✓ | Most types are both |
+| `Rc<T>` | ✗ | ✗ | Non-atomic ref counting |
+| `Arc<T>` | ✓ | ✓ | Atomic ref counting, thread-safe |
+| `RefCell<T>` | ✓* | ✗ | Interior mutability, not thread-safe |
+| `Mutex<T>` | ✓ | ✓ | Synchronization primitive |
+| `&T where T: Send` | ✓ | ✓ | References inherit traits |
+| `*const T` | ✗ | ✗ | Raw pointers are neither |
+
+The `*` on `RefCell<T>`: it's `Send` only if `T` is `Send`. That is, if the contents are `Send`, then the whole thing is safe to move to another thread (because moving transfers ownership).
+
+### Why the Compiler Cares
+
+When you try to move a type across threads or share a reference in a closure sent to another thread, the compiler checks these traits:
+
+```rust
+let rc = std::rc::Rc::new(42);
+thread::spawn(move || {
+    println!("{}", rc);  // error: `Rc<i32>` cannot be sent between threads safely
+});
+```
+
+The error message is saying: "`Rc` is not `Send`, so you can't move it to another thread. It uses non-atomic reference counting, which isn't thread-safe. Use `Arc` instead."
+
+### A Quick Mental Model
+
+<Callout variant="intuition">
+When you see a compiler error about `Send`/`Sync`, read it as: "You tried to share or move X across threads, but X is not guaranteed to be safe for that." The fix is usually one of:
+- Wrap in `Arc<T>` for shared ownership across threads
+- Wrap in `Arc<Mutex<T>>` for shared mutable data
+- Clone the data instead of sharing it
+- Restructure to avoid sharing (e.g., use scoped threads instead of moving)
+</Callout>
+
+---
+
+## Putting It All Together
+
+Let's review which tool to reach for in different situations:
+
+| Scenario | Tool |
+|---|---|
+| Spawn one thread to do a task, return a value | `thread::spawn(move \|\| { ... }).join()` |
+| Parallel work over owned data | Multiple `spawn` calls, then join all |
+| Need a thread name for debugging | `thread::Builder::new().name(...).spawn(...)` |
+| Per-thread state, no sharing | `thread_local!` + `RefCell` |
+| Threads that borrow from the parent | `thread::scope` |
+| Handle worker thread panic | `join()` + match the `Result` |
+| Shared data across threads | `Arc<Mutex<T>>` or `Arc<RwLock<T>>` |
+
+<Callout variant="summary">
+Rust threads are not magic — they're just OS threads with ownership rules enforced at compile time. Once the ownership model clicked for me, the borrow checker's thread errors stopped being frustrating and started feeling like a safety net. The compiler is teaching you that your code is safe, one error message at a time.
+
+Start with `thread::spawn` and `JoinHandle`. Graduate to scoped threads. Use thread-local storage for isolation and `Arc<Mutex<T>>` for sharing. Always join your threads. You'll write concurrent code with confidence.
+</Callout>
+
+---
+
+## References
+
+- [The Rust Book — Chapter 16: Fearless Concurrency](https://doc.rust-lang.org/book/ch16-00-concurrency.html)
+- [Rust Standard Library — `std::thread`](https://doc.rust-lang.org/std/thread/index.html)
+- [Rustonomicon — Send and Sync](https://doc.rust-lang.org/nomicon/send-and-sync.html)
+- [Scoped Threads Stabilization (Rust 1.63)](https://github.com/rust-lang/rust/pull/104577)
