@@ -1,0 +1,494 @@
+---
+title: "Learning Rust's Arc and Mutex: Sharing Mutable State Between Threads"
+description: "A beginner's guide to safely sharing and modifying data across threads using Arc<Mutex<T>> — understanding ownership, borrowing, and synchronization."
+date: 2026-04-03
+tags: ["Rust", "Threads", "Mutex", "Arc", "Shared State", "Beginner"]
+draft: false
+authors: ['jiande']
+---
+
+import Callout from '@/components/Callout.astro'
+
+## Introduction
+
+After learning how to spawn threads and use `thread::scope` to borrow data, I hit a wall: *what if I need to modify shared data from multiple threads?*
+
+The previous post covered how to read data across threads using scoped borrowing. This post tackles the much harder problem: **sharing mutable state**. This is where most concurrency bugs live. It's also where Rust's design shines — the compiler forces you to think about synchronization before anything breaks.
+
+If you haven't read [Learning Rust Threads](/blog/rust-thread-spawn), start there. This post builds directly on those concepts.
+
+---
+
+## The Problem: Modifying Shared Data
+
+Imagine you have a counter and you want multiple threads to increment it:
+
+```rust
+let mut counter = 0;
+
+thread::spawn(move || {
+    counter += 1;  // Error: cannot move mutable local variable
+});
+
+thread::spawn(move || {
+    counter += 1;  // Same error
+});
+```
+
+This doesn't compile. Why? The first thread moves `counter`, so the second thread can't move the same variable. Even if it could, the borrow checker would reject it: two threads trying to mutate the same data with no synchronization is a data race waiting to happen.
+
+In other languages, you might reach for a lock. Rust forces you to reach for a lock *because the compiler won't let you do it any other way*.
+
+---
+
+## Meet the Players: `Arc`, `Mutex`, and `lock()`
+
+Solving this requires two types working together:
+
+- **`Arc<T>`** — **Atomic Reference Counting**. A thread-safe pointer that lets multiple threads own the same value.
+- **`Mutex<T>`** — A **mutual exclusion lock**. Only one thread can access the protected data at a time.
+
+Together, `Arc<Mutex<T>>` is the workhorse pattern for sharing mutable data in Rust.
+
+<Callout variant="note">
+`Arc` is similar to `Rc` from the previous post — it's reference counting. But `Arc` uses atomic operations, making it thread-safe. The downside: atomic operations are slightly slower than non-atomic reference counting. Use `Rc` in single-threaded code, `Arc` when sharing across threads.
+</Callout>
+
+---
+
+## Building the Pattern: Step by Step
+
+Let's build a concurrent counter from scratch, understanding each piece.
+
+### Step 1: Protect Data with `Mutex<T>`
+
+First, wrap your data in a `Mutex`:
+
+```rust
+use std::sync::Mutex;
+
+let counter = Mutex::new(0);
+```
+
+A `Mutex` ensures only one thread accesses the protected data at a time. To read or modify the data, you must call `.lock()`:
+
+```rust
+let counter = Mutex::new(0);
+let mut count = counter.lock().unwrap();
+*count += 1;  // Modify the protected data
+// count is dropped here, releasing the lock
+```
+
+`.lock()` returns a `Result`. If the lock is held by another thread, it blocks until available. `.unwrap()` panics if the lock was poisoned (the thread that held it panicked). In production, handle this more carefully.
+
+<Callout variant="intuition">
+Think of `Mutex::lock()` like checking out a library book. Only one person can hold the book at a time. When you're done, you return it (by dropping the guard), and the next person can check it out. The `.unwrap()` handles the rare case where the book was damaged (lock poisoned).
+</Callout>
+
+### Step 2: Enable Sharing Across Threads with `Arc<T>`
+
+A `Mutex<T>` by itself can't be shared across threads because `move` closures transfer ownership. You need multiple threads to *own* the same `Mutex`. This is what `Arc` does:
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+let counter = Arc::new(Mutex::new(0));  // Wrapped twice!
+
+let counter_clone = Arc::clone(&counter);  // Share ownership
+thread::spawn(move || {
+    let mut count = counter_clone.lock().unwrap();
+    *count += 1;
+});
+
+// Original counter is still valid
+let count = counter.lock().unwrap();
+println!("Count: {}", *count);
+```
+
+`Arc::clone(&counter)` creates a new reference to the same data (not a deep copy). Multiple threads can own this reference independently.
+
+<Callout variant="warning">
+**Don't** use `counter.clone()`. That also works but is less clear about intent. Use `Arc::clone(&counter)` — it signals "sharing, not copying" to readers. Some Rust codebases configure clippy to warn about `.clone()` on `Arc` types.
+</Callout>
+
+### Step 3: Full Pattern — Multiple Threads Incrementing
+
+Here's the complete pattern:
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+let counter = Arc::new(Mutex::new(0));
+let mut handles = Vec::new();
+
+for _ in 0..5 {
+    let counter = Arc::clone(&counter);  // Share ownership
+    let handle = thread::spawn(move || {
+        for _ in 0..10 {
+            let mut count = counter.lock().unwrap();
+            *count += 1;
+            // Lock is released when `count` is dropped
+        }
+    });
+    handles.push(handle);
+}
+
+// Wait for all threads
+for handle in handles {
+    handle.join().unwrap();
+}
+
+// Get final value
+let final_count = *counter.lock().unwrap();
+println!("Final count: {}", final_count);  // Final count: 50
+```
+
+Let's trace through the flow:
+
+1. `Arc::new(Mutex::new(0))` creates a thread-safe counter, initially 0.
+2. In each loop iteration, `Arc::clone(&counter)` creates a new reference to the same counter.
+3. `thread::spawn(move || { ... })` moves that reference into the closure. Each thread owns a clone of the `Arc`, not the `Mutex` itself.
+4. Inside the thread, `.lock().unwrap()` acquires the lock, giving us mutable access.
+5. `*count += 1` modifies the protected data.
+6. When `count` is dropped (at the end of the loop or scope), the lock is released.
+7. `.join()` waits for all threads to finish.
+8. The final `counter.lock().unwrap()` accesses the shared counter from the main thread.
+
+<Callout variant="tip">
+The key insight: **The lock is held for the shortest possible time.** Lock, modify, drop. This minimizes contention and prevents deadlocks. If you held the lock across network requests or I/O, you'd serialize all threads — defeating the purpose of concurrency.
+</Callout>
+
+---
+
+## Understanding the Two Layers
+
+Understanding why you need *both* `Arc` and `Mutex` unlocks a lot of Rust thinking.
+
+### `Mutex<T>` — Synchronization
+
+`Mutex<T>` ensures *mutual exclusion*. Only one thread accesses the data at a time. Without it:
+
+```rust
+let counter = Arc::new(0);  // Just Arc, no Mutex
+// Two threads both read counter, both increment, both write back
+// Result: 1 instead of 2 (lost update, data race)
+```
+
+A `Mutex` prevents this by forcing serialized access.
+
+### `Arc<T>` — Ownership
+
+`Arc<T>` enables shared ownership. Without it:
+
+```rust
+let counter = Mutex::new(0);
+thread::spawn(move || {
+    counter.lock().unwrap().  // error: `counter` was moved
+});
+thread::spawn(move || {
+    counter.lock().unwrap();  // error: `counter` was already moved
+});
+```
+
+You can't move the same value to two threads. `Arc` lets multiple threads own pointers to the same value.
+
+<Callout variant="intuition">
+**Mutex** = "Only one person in the bathroom at a time" (mutual exclusion).
+**Arc** = "The door key can be duplicated, so multiple people can own a key" (shared ownership).
+
+Together: multiple threads own keys to the same bathroom, but only one can be inside at a time.
+</Callout>
+
+---
+
+## Common Pattern: Collect Results from Threads
+
+Instead of modifying a counter, what if you want threads to *collect* results?
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+let results = Arc::new(Mutex::new(Vec::new()));
+let mut handles = Vec::new();
+
+for i in 0..5 {
+    let results = Arc::clone(&results);
+    let handle = thread::spawn(move || {
+        let computation = i * 2;  // Simulate some work
+        let mut vec = results.lock().unwrap();
+        vec.push(computation);
+    });
+    handles.push(handle);
+}
+
+for handle in handles {
+    handle.join().unwrap();
+}
+
+let mut final_results = results.lock().unwrap();
+final_results.sort();
+println!("Results: {:?}", *final_results);  // Results: [0, 2, 4, 6, 8]
+```
+
+The pattern is identical: `Arc<Mutex<T>>` where `T` can be any type — a counter, a vector, a struct, anything.
+
+<Callout variant="tip">
+After collecting results, you often want to inspect or process them. A common mistake is forgetting to hold the lock while doing this processing. If you don't need the lock anymore, drop it explicitly:
+
+```rust
+let results = Arc::new(Mutex::new(Vec::new()));
+
+// ... threads push results ...
+
+let mut vec = results.lock().unwrap();
+vec.sort();  // Process while holding lock
+// Lock is dropped here
+println!("Sorted: {:?}", *vec);  // vec is no longer accessible
+```
+
+Alternatively, extract the data:
+
+```rust
+let vec = results.lock().unwrap().clone();  // Clone, then drop lock
+vec.sort();  // Process without holding lock
+```
+</Callout>
+
+---
+
+## Gotchas and Debugging
+
+### Gotcha 1: Forgetting `.clone()` (or `Arc::clone()`)
+
+This is the most common mistake:
+
+```rust
+let counter = Arc::new(Mutex::new(0));
+
+for _ in 0..3 {
+    thread::spawn(move || {  // OOPS: moves counter once
+        counter.lock().unwrap();  // But which thread gets it?
+    });
+}
+```
+
+The first thread moves `counter`, and the remaining threads can't access it. You must clone for each thread:
+
+```rust
+for _ in 0..3 {
+    let counter = Arc::clone(&counter);  // Clone for each iteration
+    thread::spawn(move || {
+        counter.lock().unwrap();
+    });
+}
+```
+
+<Callout variant="warning">
+The compiler error message for this is confusing: "value used after move" or "expected Arc, found Arc". The fix is always the same: clone in the loop.
+</Callout>
+
+### Gotcha 2: Lock Poisoning
+
+If a thread panics while holding a lock, the `Mutex` becomes "poisoned". Future `.lock()` calls return `Err`:
+
+```rust
+let counter = Arc::new(Mutex::new(0));
+let counter_clone = Arc::clone(&counter);
+
+thread::spawn(move || {
+    let mut count = counter_clone.lock().unwrap();
+    panic!("Oops!");
+    // Lock is never released — poisoned
+});
+
+std::thread::sleep(std::time::Duration::from_millis(10));
+
+// This will panic when unwrapped
+counter.lock().unwrap();  // error: poisoned lock
+```
+
+In production, handle poisoned locks:
+
+```rust
+match counter.lock() {
+    Ok(mut count) => { *count += 1; },
+    Err(e) => {
+        eprintln!("Lock poisoned: {}", e);
+        // Either panic or recover
+    }
+}
+```
+
+Or use `.lock().unwrap_or_else()` to recover a poisoned lock:
+
+```rust
+let mut count = counter.lock().unwrap_or_else(|e| e.into_inner());
+*count += 1;
+```
+
+### Gotcha 3: Deadlocks
+
+Deadlocks are rare with a single `Mutex`, but possible with multiple:
+
+```rust
+let a = Arc::new(Mutex::new(0));
+let b = Arc::new(Mutex::new(0));
+
+// Thread 1: locks a, then tries to lock b
+let a1 = Arc::clone(&a);
+let b1 = Arc::clone(&b);
+thread::spawn(move || {
+    let _x = a1.lock().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let _y = b1.lock().unwrap();  // Waiting for b
+});
+
+// Thread 2: locks b, then tries to lock a
+let a2 = Arc::clone(&a);
+let b2 = Arc::clone(&b);
+thread::spawn(move || {
+    let _y = b2.lock().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let _x = a2.lock().unwrap();  // Waiting for a
+});
+```
+
+Thread 1 holds `a` and waits for `b`. Thread 2 holds `b` and waits for `a`. Deadlock.
+
+The rule: **Always acquire locks in the same order**. If this is complex, redesign to use fewer locks or use higher-level abstractions.
+
+<Callout variant="danger">
+The Rust compiler cannot catch deadlocks at compile time — this is a runtime hazard. However, Rust makes deadlocks visible and avoidable through careful lock ordering and minimal critical sections.
+</Callout>
+
+---
+
+## When to Use `Arc<Mutex<T>>`
+
+Not every shared value needs `Arc<Mutex<T>>`. Here's a decision tree:
+
+| Scenario | Use | Reason |
+|---|---|---|
+| One thread reads/writes, others read | `Arc<T>` only | Readers don't need a lock |
+| All threads read the same data | `Arc<T>` only | No mutations, no lock needed |
+| Threads modify the same data | `Arc<Mutex<T>>` | Must serialize access |
+| Multiple readers, exclusive writer | `Arc<RwLock<T>>` | Readers don't block each other |
+| Complex shared state with channels | `Arc<Mutex<T>>` or channels | Depends on communication pattern |
+
+<Callout variant="note">
+`RwLock<T>` (reader-writer lock) is another synchronization primitive. It allows many readers OR one writer, but not both. Use it when reads heavily outnumber writes. For this post, we're focusing on `Mutex`, which is simpler and faster when contention is moderate.
+</Callout>
+
+---
+
+## The Full Picture: `Send` and `Sync` Again
+
+Remember `Send` and `Sync` from the previous post? They're relevant here.
+
+- `Mutex<T>` is `Sync` (safe to share references) because the mutex ensures exclusive access.
+- `Arc<T>` is `Send` and `Sync` if `T` is `Send` and `Sync`.
+- **Together**, `Arc<Mutex<T>>` is `Send` and `Sync` as long as `T` is `Send`.
+
+This is why the compiler allows you to move `Arc<Mutex<T>>` to another thread and share it — the types implement the required traits.
+
+```rust
+let counter: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+// Arc<Mutex<usize>> is Send and Sync because:
+// - usize is Send
+// - Mutex<usize> is Sync
+// - Arc wraps them safely
+
+thread::spawn(move || {
+    // Moving Arc<Mutex<usize>> across threads is safe
+    counter.lock().unwrap();
+});
+```
+
+---
+
+## Practical Example: Word Counter
+
+Let's build something more realistic — counting word frequencies from multiple text chunks processed in parallel:
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::collections::HashMap;
+
+fn count_words_parallel(texts: Vec<&str>) -> HashMap<String, usize> {
+    let word_counts = Arc::new(Mutex::new(HashMap::new()));
+    let mut handles = Vec::new();
+
+    for text in texts {
+        let word_counts = Arc::clone(&word_counts);
+        let handle = thread::spawn(move || {
+            for word in text.split_whitespace() {
+                let mut counts = word_counts.lock().unwrap();
+                *counts.entry(word.to_string())
+                    .or_insert(0) += 1;
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Extract and return the final counts
+    Arc::try_unwrap(word_counts)
+        .unwrap_or_else(|arc| (*arc.lock().unwrap()).clone())
+        .into_inner()
+        .unwrap()
+}
+
+let texts = vec![
+    "hello world hello rust",
+    "rust is great",
+    "hello rust world",
+];
+
+let counts = count_words_parallel(texts);
+println!("Word counts: {:?}", counts);
+```
+
+Here, multiple threads safely modify a shared `HashMap` by locking, incrementing, and releasing the lock.
+
+---
+
+## From Theory to Practice
+
+The pattern `Arc<Mutex<T>>` appears everywhere in Rust concurrent code:
+
+- **Caches**: Shared, mutable cache accessed by worker threads.
+- **Counters**: Metrics updated by multiple threads.
+- **Queues**: Collecting results from parallel jobs.
+- **Configuration**: Shared state that changes over time (though often read-heavy, suitable for `Arc<RwLock<T>>`).
+
+Once you internalize this pattern, a huge class of concurrency problems becomes manageable.
+
+<Callout variant="summary">
+**Key takeaways:**
+
+1. `Mutex<T>` protects data from concurrent modification (one thread at a time).
+2. `Arc<T>` enables shared ownership across threads.
+3. **Together**, `Arc<Mutex<T>>` is the foundational pattern for shared mutable state.
+4. Lock, modify, release — keep critical sections small.
+5. Handle lock poisoning and deadlocks carefully.
+6. Not everything needs a lock — understand when reads, borrows, or channels are better.
+
+Start simple with single-threaded code. Introduce `Arc<Mutex<T>>` only when you need to share mutable state. The pattern is consistent, the rules are enforced by the compiler, and the results are safe.
+</Callout>
+
+---
+
+## References
+
+- [The Rust Book — Chapter 16: Sharing State](https://doc.rust-lang.org/book/ch16-03-shared-state.html)
+- [Rust Standard Library — `Arc<T>`](https://doc.rust-lang.org/std/sync/struct.Arc.html)
+- [Rust Standard Library — `Mutex<T>`](https://doc.rust-lang.org/std/sync/struct.Mutex.html)
+- [Rust Concurrency Patterns — Locking](https://www.oreilly.com/library/view/concurrency-in-rust/9781491927281/)
+- [Rustonomicon — Concurrency](https://doc.rust-lang.org/nomicon/concurrency.html)
